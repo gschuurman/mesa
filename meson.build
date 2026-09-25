@@ -994,6 +994,7 @@ endif
 
 with_gfx_compute = [
   with_any_opengl,
+  get_option('teflon'),
   with_any_vk,
   with_clc,
   with_gallium_va and with_video_encode,
