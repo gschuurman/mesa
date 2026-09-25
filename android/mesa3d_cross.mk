@@ -82,8 +82,16 @@ MESA3D_GLES_BINS := \
     $($(M_TARGET_PREFIX)MESA3D_LIBGLESV1_BIN) \
     $($(M_TARGET_PREFIX)MESA3D_LIBGLESV2_BIN) \
 
+# Host tools can be overridden by the board, e.g. to use meson/ninja/python
+# from a venv (the host may lack meson >= 1.4 or python3-mako).
+# MESA3D_HOST_PATH is prepended to PATH for both meson and ninja, so scripts run
+# through '#!/usr/bin/env python3' pick up the same interpreter.
+MESA3D_MESON ?= meson
+MESA3D_NINJA ?= ninja
+MESA3D_HOST_PATH ?=
+
 MESON_GEN_NINJA := \
-	cd $(MESON_OUT_DIR) && PATH=/usr/bin:/usr/local/bin:$$PATH meson ./build     \
+	cd $(MESON_OUT_DIR) && PATH=$(if $(MESA3D_HOST_PATH),$(MESA3D_HOST_PATH):)/usr/bin:/usr/local/bin:$$PATH $(MESA3D_MESON) ./build     \
 	--cross-file $(call relative-to-absolute,$(MESON_GEN_DIR))/aosp_cross        \
 	--buildtype=release                                                          \
 	-Dplatforms=android                                                          \
@@ -100,7 +108,7 @@ MESON_GEN_NINJA := \
 	-Dandroid-libbacktrace=disabled                                              \
 	$(BOARD_MESA3D_MESON_ARGS)                                                   \
 
-MESON_BUILD := PATH=/usr/bin:/bin:/sbin:$$PATH ninja -C $(MESON_OUT_DIR)/build
+MESON_BUILD := PATH=$(if $(MESA3D_HOST_PATH),$(MESA3D_HOST_PATH):)/usr/bin:/bin:/sbin:$$PATH $(MESA3D_NINJA) -C $(MESON_OUT_DIR)/build
 
 $(MESON_GEN_FILES_TARGET): MESON_CPU_FAMILY := $(subst arm64,aarch64,$(TARGET_$(M_TARGET_PREFIX)ARCH))
 
