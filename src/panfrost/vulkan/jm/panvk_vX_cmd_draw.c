@@ -1896,6 +1896,29 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
    panvk_cmd_draw_indirect(cmdbuf, &draw);
 }
 
+/* vkCmdDraw*IndirectCount are core entry points since Vulkan 1.2, but JM
+ * doesn't advertise the drawIndirectCount feature, so applications are not
+ * allowed to call them. They only exist to fill the dispatch table.
+ */
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndirectCount)(VkCommandBuffer commandBuffer,
+                                     VkBuffer _buffer, VkDeviceSize offset,
+                                     VkBuffer countBuffer,
+                                     VkDeviceSize countBufferOffset,
+                                     uint32_t maxDrawCount, uint32_t stride)
+{
+   UNREACHABLE("drawIndirectCount is not supported on JM");
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndexedIndirectCount)(
+   VkCommandBuffer commandBuffer, VkBuffer _buffer, VkDeviceSize offset,
+   VkBuffer countBuffer, VkDeviceSize countBufferOffset,
+   uint32_t maxDrawCount, uint32_t stride)
+{
+   UNREACHABLE("drawIndirectCount is not supported on JM");
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
                                   const VkRenderingInfo *pRenderingInfo)
