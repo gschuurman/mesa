@@ -236,6 +236,12 @@ check_global_priority(const struct panvk_physical_device *phys_dev,
       if (requested_prio & allowed_prio_mask)
          return VK_SUCCESS;
 
+      /* NOT_PERMITTED is for priorities above medium that need privileges.
+       * A priority outside the advertised range is an initialization failure.
+       */
+      if (priority <= VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR)
+         return VK_ERROR_INITIALIZATION_FAILED;
+
       return VK_ERROR_NOT_PERMITTED_KHR;
    }
 
