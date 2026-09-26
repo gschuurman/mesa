@@ -89,7 +89,8 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_maintenance9 = true,
       .KHR_map_memory2 = true,
       .KHR_multiview = true,
-      .KHR_pipeline_binary = true,
+      /* Depends on VK_KHR_maintenance5. */
+      .KHR_pipeline_binary = has_vk1_1,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
