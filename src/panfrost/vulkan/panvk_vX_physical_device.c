@@ -41,8 +41,8 @@ panvk_per_arch(get_physical_device_extensions)(
 {
    bool has_vk1_1 = PAN_ARCH >= 10;
    bool has_vk1_2 = PAN_ARCH >= 10;
-   /* Bifrost v7 exposes Vulkan 1.2, which needs these as core features. */
-   bool has_v7_vk1_2 = PAN_ARCH == 7;
+   /* Bifrost v7 exposes Vulkan 1.3, plus the 1.4 extensions it supports. */
+   bool has_v7_core = PAN_ARCH == 7;
    bool has_gralloc = vk_android_get_ugralloc() != NULL;
 
    *ext = (struct vk_device_extension_table){
@@ -83,16 +83,16 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
-      .KHR_maintenance4 = has_vk1_1,
-      .KHR_maintenance5 = has_vk1_1,
-      .KHR_maintenance6 = has_vk1_1,
+      .KHR_maintenance4 = has_vk1_1 || has_v7_core,
+      .KHR_maintenance5 = has_vk1_1 || has_v7_core,
+      .KHR_maintenance6 = has_vk1_1 || has_v7_core,
       .KHR_maintenance7 = has_vk1_1,
       .KHR_maintenance8 = has_vk1_1,
       .KHR_maintenance9 = true,
       .KHR_map_memory2 = true,
       .KHR_multiview = true,
       /* Depends on VK_KHR_maintenance5. */
-      .KHR_pipeline_binary = has_vk1_1,
+      .KHR_pipeline_binary = has_vk1_1 || has_v7_core,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
@@ -105,7 +105,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_shader_draw_parameters = true,
       .KHR_shader_expect_assume = true,
       .KHR_shader_float_controls = true,
-      .KHR_shader_float_controls2 = has_vk1_1,
+      .KHR_shader_float_controls2 = has_vk1_1 || has_v7_core,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_fma = true,
       .KHR_shader_integer_dot_product = true,
@@ -113,12 +113,12 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_shader_non_semantic_info = true,
       .KHR_shader_quad_control = has_vk1_2,
       .KHR_shader_relaxed_extended_instruction = true,
-      .KHR_shader_subgroup_extended_types = has_vk1_1 || has_v7_vk1_2,
+      .KHR_shader_subgroup_extended_types = has_vk1_1 || has_v7_core,
       .KHR_shader_subgroup_rotate = true,
       .KHR_shader_subgroup_uniform_control_flow = has_vk1_1,
       .KHR_shader_terminate_invocation = true,
       .KHR_shader_untyped_pointers = PAN_ARCH >= 9,
-      .KHR_spirv_1_4 = PAN_ARCH >= 10 || has_v7_vk1_2,
+      .KHR_spirv_1_4 = PAN_ARCH >= 10 || has_v7_core,
       .KHR_storage_buffer_storage_class = true,
 #ifdef PANVK_USE_WSI_PLATFORM
       .KHR_present_id = true,
@@ -217,7 +217,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_shader_subgroup_vote = true,
       .EXT_shader_tile_image = PAN_ARCH >= 9,
       .EXT_shader_uniform_buffer_unsized_array = true,
-      .EXT_subgroup_size_control = has_vk1_1,
+      .EXT_subgroup_size_control = has_vk1_1 || has_v7_core,
 #ifdef PANVK_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1 = true,
 #endif
@@ -777,7 +777,7 @@ get_api_version()
       return VK_MAKE_API_VERSION(0, 1, 4, VK_HEADER_VERSION);
 
    if (PAN_ARCH == 7)
-      return VK_MAKE_API_VERSION(0, 1, 2, VK_HEADER_VERSION);
+      return VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION);
 
    return VK_MAKE_API_VERSION(0, 1, 0, VK_HEADER_VERSION);
 }
