@@ -181,11 +181,19 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
        *   "When an occlusion query begins, the count of passing samples
        *    always starts at zero."
        *
+       * With multiview, the query uses one query per view: all views count
+       * into the first one, the others stay zero.
        */
-      for (unsigned i = 0; i < pool->reports_per_query; i++) {
-         panvk_emit_write_job(
-            cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64,
-            report_addr + i * sizeof(struct panvk_query_report), 0);
+      const uint32_t n_views =
+         MAX2(1, util_bitcount(cmd->state.gfx.render.view_mask));
+      for (uint32_t q = query; q < query + n_views; q++) {
+         uint64_t addr = panvk_query_report_dev_addr(pool, q);
+
+         for (unsigned i = 0; i < pool->reports_per_query; i++) {
+            panvk_emit_write_job(
+               cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64,
+               addr + i * sizeof(struct panvk_query_report), 0);
+         }
       }
       break;
    }
@@ -228,9 +236,13 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
       UNREACHABLE("Unsupported query type");
    }
 
-   uint64_t available_addr = panvk_query_available_dev_addr(pool, query);
-   panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
-                        available_addr, 1);
+   /* With multiview, every per-view query becomes available. */
+   const uint32_t n_views =
+      MAX2(1, util_bitcount(cmd->state.gfx.render.view_mask));
+   for (uint32_t q = query; q < query + n_views; q++) {
+      panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
+                           panvk_query_available_dev_addr(pool, q), 1);
+   }
 
    close_batch(cmd, had_batch);
 }
