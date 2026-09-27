@@ -263,8 +263,8 @@ optimizations += [
    (('ilt', ('iand', a, b), '#b(is_pos_power_of_two)'), ('ieq', ('iand', a, b), 0)),
    (('ieq', ('ushr(is_used_once)', a, '#b'), 0), ('ult', a, ('ishl', 1, b))),
    (('ine', ('ushr(is_used_once)', a, '#b'), 0), ('uge', a, ('ishl', 1, b))),
-   (('~fadd', ('fneg', a), a), 0.0),
-   (('fadd(nnan)', ('fneg', a), a), 0.0),
+   # NaN + -NaN and Inf + -Inf are NaN, so this needs both nnan and ninf.
+   (('fadd(nnan,ninf)', ('fneg', a), a), 0.0),
    (('iadd', ('ineg', a), a), 0),
    (('iadd', ('ineg', a), ('iadd', a, b)), b),
    (('iadd', a, ('iadd', ('ineg', a), b)), b),
