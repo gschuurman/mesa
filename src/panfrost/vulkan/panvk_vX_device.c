@@ -228,10 +228,12 @@ check_global_priority(const struct panvk_physical_device *phys_dev,
 
       /* Non-medium priority context is not hooked-up in the JM backend, even
        * though the panfrost kmod advertize it. Manually filter non-medium
-       * priority for now.
+       * priority for now. LOW is accepted and runs at medium.
        */
       if (arch < 10)
-         allowed_prio_mask &= PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
+         allowed_prio_mask =
+            (allowed_prio_mask & PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM) |
+            PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW;
 
       if (requested_prio & allowed_prio_mask)
          return VK_SUCCESS;
