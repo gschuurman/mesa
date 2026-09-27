@@ -29,13 +29,12 @@
 
 #if PAN_ARCH < 9
 
-/* On Bifrost, this is a software limit. We pick the minimum required by
- * Vulkan, because Bifrost GPUs don't have unified descriptor tables,
- * which forces us to aggregate all descriptors from all sets and dispatch
- * them to per-type descriptor tables emitted at draw/dispatch time. The
- * more sets we support the more copies we are likely to have to do at
- * draw time. */
-#define MAX_SETS 4
+/* On Bifrost, this is a software limit. Bifrost GPUs don't have unified
+ * descriptor tables, which forces us to aggregate all descriptors from all
+ * sets and dispatch them to per-type descriptor tables emitted at
+ * draw/dispatch time. The more sets we support the more copies we are likely
+ * to have to do at draw time, but Vulkan 1.4 requires at least 7. */
+#define MAX_SETS 7
 
 /* MALI_RENDERER_STATE::sampler_count is 16-bit. */
 #define MAX_PER_SET_SAMPLERS UINT16_MAX
