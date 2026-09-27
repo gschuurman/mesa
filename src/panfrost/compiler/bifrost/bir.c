@@ -222,17 +222,21 @@ bi_side_effects(const bi_instr *I)
 
 /* Branch reconvergence is required when the execution mask may change
  * between adjacent instructions (clauses). This occurs for conditional
- * branches and for the last instruction (clause) in a block whose
- * fallthrough successor has multiple predecessors.
+ * branches, for the last instruction (clause) in a block whose
+ * fallthrough successor has multiple predecessors, and for jumps out of a
+ * loop, since the iteration count needn't be warp-invariant.
  */
 
 bool
 bi_reconverge_branches(bi_block *block)
 {
-   if (bi_num_successors(block) == 1)
-      return bi_num_predecessors(block->successors[0]) > 1;
-   else
+   if (bi_num_successors(block) == 1) {
+      bi_block *succ = block->successors[0];
+
+      return succ->loop_exit || bi_num_predecessors(succ) > 1;
+   } else {
       return true;
+   }
 }
 
 /*

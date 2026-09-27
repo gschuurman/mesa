@@ -970,6 +970,12 @@ typedef struct bi_block {
    bool unconditional_jumps;
    bool loop_header;
 
+   /* Target of a loop's break. Invocations may leave the loop in different
+    * iterations, so jumps to this block need branch reconvergence even when
+    * it has a single predecessor.
+    */
+   bool loop_exit;
+
    /* Per 32-bit word live masks for the block indexed by node */
    uint8_t *live_in;
    uint8_t *live_out;

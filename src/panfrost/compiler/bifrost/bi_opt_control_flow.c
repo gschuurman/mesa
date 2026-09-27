@@ -133,12 +133,14 @@ try_remove_simple_block(bi_block *prev, bi_block *block, bi_block *next,
        *     - 'pred' falls through 'next'.
        */
       last_instr->branch_target = succ;
+      succ->loop_exit |= block->loop_exit;
       remove_simple_block(block);
       return true;
    } else if (!last_instr_is_branch && pred == prev && succ == next) {
       /* Remove 'simple block' when it is between its predecessor and successor
        * when predecessor fall through 'simple block' (without a branch).
        */
+      succ->loop_exit |= block->loop_exit;
       remove_simple_block(block);
       return true;
    }
