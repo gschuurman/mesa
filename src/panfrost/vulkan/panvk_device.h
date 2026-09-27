@@ -68,6 +68,16 @@ struct panvk_device {
 
    struct panvk_priv_bo *tiler_heap;
    struct panvk_priv_bo *indirect_varying_buffer;
+
+   /* JM: GPU queues share the tiler heap and other device-wide buffers, so
+    * submissions from all queues are serialized through the last_submit
+    * syncobj. Created with the first GPU queue, destroyed with the last one.
+    */
+   struct {
+      simple_mtx_t lock;
+      uint32_t last_submit;
+      unsigned queue_count;
+   } jm_submit;
    struct panvk_priv_bo *sample_positions;
 
    struct {

@@ -565,8 +565,9 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
          .queueFlags =
             VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
          /* On v10+ we can support up to 127 queues but this causes timeout on
-            some CTS tests */
-         .queueCount = arch >= 10 ? 2 : 1,
+            some CTS tests. JM queues are serialized against each other (see
+            panvk_device::jm_submit), HWUI needs two. */
+         .queueCount = 2,
          .timestampValidBits =
             arch >= 10 &&
                   physical_device->kmod.dev->props.gpu_can_query_timestamp

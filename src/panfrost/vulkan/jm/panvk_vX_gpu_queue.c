@@ -234,16 +234,21 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
 
-   unsigned nr_semaphores = submit->wait_count + 1;
+   unsigned nr_semaphores = submit->wait_count + 2;
    uint32_t semaphores[nr_semaphores];
+   bool submitted = false;
+
+   /* Wait on the last job submitted by any queue, see panvk_device::jm_submit. */
+   simple_mtx_lock(&dev->jm_submit.lock);
 
    semaphores[0] = queue->sync;
+   semaphores[1] = dev->jm_submit.last_submit;
    for (unsigned i = 0; i < submit->wait_count; i++) {
       assert(vk_sync_type_is_drm_syncobj(submit->waits[i].sync->type));
       struct vk_drm_syncobj *syncobj =
          vk_sync_as_drm_syncobj(submit->waits[i].sync);
 
-      semaphores[i + 1] = syncobj->syncobj;
+      semaphores[i + 2] = syncobj->syncobj;
    }
 
    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
@@ -306,10 +311,19 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
 
          panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos, in_fences,
                                   nr_in_fences);
+         submitted |= batch->vtc_jc.first_job || batch->frag_jc.first_job;
 
          panvk_signal_event_syncobjs(queue, batch);
       }
    }
+
+   /* Only advance last_submit when this queue's sync holds a newer job, so
+    * it never moves back to an older fence.
+    */
+   if (submitted)
+      panvk_queue_transfer_sync(queue, dev->jm_submit.last_submit);
+
+   simple_mtx_unlock(&dev->jm_submit.lock);
 
    /* Transfer the out fence to signal semaphores */
    for (unsigned i = 0; i < submit->signal_count; i++) {
@@ -359,6 +373,20 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       goto err_finish_queue;
    }
 
+   /* Queues are created and destroyed with the device, never concurrently. */
+   if (device->jm_submit.queue_count == 0) {
+      simple_mtx_init(&device->jm_submit.lock, mtx_plain);
+      ret = drmSyncobjCreate(device->drm_fd, DRM_SYNCOBJ_CREATE_SIGNALED,
+                             &device->jm_submit.last_submit);
+      if (ret) {
+         simple_mtx_destroy(&device->jm_submit.lock);
+         drmSyncobjDestroy(device->drm_fd, queue->sync);
+         result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto err_finish_queue;
+      }
+   }
+   device->jm_submit.queue_count++;
+
    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
    *out_queue = &queue->vk;
    return VK_SUCCESS;
@@ -379,6 +407,11 @@ void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
    vk_queue_finish(&queue->vk);
    drmSyncobjDestroy(dev->drm_fd, queue->sync);
    vk_free(&dev->vk.alloc, queue);
+
+   if (--dev->jm_submit.queue_count == 0) {
+      drmSyncobjDestroy(dev->drm_fd, dev->jm_submit.last_submit);
+      simple_mtx_destroy(&dev->jm_submit.lock);
+   }
 }
 
 VkResult
