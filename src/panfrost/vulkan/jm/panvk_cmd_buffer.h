@@ -60,6 +60,10 @@ struct panvk_batch {
    struct pan_tls_info tlsinfo;
    unsigned wls_total_size;
    bool issued;
+
+   /* The vertex/tiler chain writes a system timestamp, which needs the GPU
+    * cycle counter running (PANFROST_JD_REQ_CYCLE_COUNT). */
+   bool needs_cycle_count;
 };
 
 enum panvk_cmd_event_op_type {

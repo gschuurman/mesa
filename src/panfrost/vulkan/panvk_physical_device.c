@@ -569,10 +569,7 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
             panvk_device::jm_submit), HWUI needs two. */
          .queueCount = 2,
          .timestampValidBits =
-            arch >= 10 &&
-                  physical_device->kmod.dev->props.gpu_can_query_timestamp
-               ? 64
-               : 0,
+            physical_device->kmod.dev->props.gpu_can_query_timestamp ? 64 : 0,
          .minImageTransferGranularity = {1, 1, 1},
       },
       [PANVK_QUEUE_FAMILY_BIND] = {

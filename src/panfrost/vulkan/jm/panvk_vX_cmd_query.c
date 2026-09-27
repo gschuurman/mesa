@@ -121,10 +121,35 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
                                    VkPipelineStageFlags2 stage,
                                    VkQueryPool queryPool, uint32_t query)
 {
-   UNUSED VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
-   UNUSED VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
 
-   panvk_stub();
+   /* JM has no finer-grained stage tracking: close the current batch so the
+    * timestamp is taken after all previous work, whatever the stage, and
+    * write it at the start of a new batch. Like CmdEndQuery, keep that batch
+    * open if we were recording into one (e.g. inside a render pass).
+    */
+   bool end_sync = cmd->cur_batch != NULL;
+   if (end_sync)
+      panvk_per_arch(cmd_close_batch)(cmd);
+
+   bool had_batch;
+   struct panvk_batch *batch = open_batch(cmd, &had_batch);
+   had_batch |= end_sync;
+
+   /* With multiview, the timestamp uses one query per view. */
+   const uint32_t n_views =
+      MAX2(1, util_bitcount(cmd->state.gfx.render.view_mask));
+
+   batch->needs_cycle_count = true;
+   for (uint32_t q = query; q < query + n_views; q++) {
+      panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
+                           panvk_query_report_dev_addr(pool, q), 0);
+      panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
+                           panvk_query_available_dev_addr(pool, q), 1);
+   }
+
+   close_batch(cmd, had_batch);
 }
 
 VKAPI_ATTR void VKAPI_CALL

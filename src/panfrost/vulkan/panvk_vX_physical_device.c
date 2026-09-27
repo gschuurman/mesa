@@ -101,7 +101,10 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
-      .KHR_shader_clock = device->kmod.dev->props.gpu_can_query_timestamp,
+      /* On JM, shader clock reads would need the cycle counter running for
+       * every job, which we don't request. */
+      .KHR_shader_clock = PAN_ARCH >= 10 &&
+                          device->kmod.dev->props.gpu_can_query_timestamp,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_expect_assume = true,
       .KHR_shader_float_controls = true,
@@ -767,7 +770,7 @@ panvk_per_arch(get_physical_device_features)(
 }
 
 static uint32_t
-get_api_version()
+get_api_version(const struct panvk_physical_device *device)
 {
    const uint32_t version_override = vk_get_version_override();
    if (version_override)
@@ -776,8 +779,13 @@ get_api_version()
    if (PAN_ARCH >= 10)
       return VK_MAKE_API_VERSION(0, 1, 4, VK_HEADER_VERSION);
 
-   if (PAN_ARCH == 7)
-      return VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION);
+   /* Vulkan 1.4 requires timestampComputeAndGraphics, which needs the
+    * panfrost SYSTEM_TIMESTAMP params and cycle-count jobs (uapi 1.3). */
+   if (PAN_ARCH == 7) {
+      return device->kmod.dev->props.gpu_can_query_timestamp
+                ? VK_MAKE_API_VERSION(0, 1, 4, VK_HEADER_VERSION)
+                : VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION);
+   }
 
    return VK_MAKE_API_VERSION(0, 1, 0, VK_HEADER_VERSION);
 }
@@ -825,7 +833,7 @@ panvk_per_arch(get_physical_device_properties)(
    }
 
    *properties = (struct vk_properties){
-      .apiVersion = get_api_version(),
+      .apiVersion = get_api_version(device),
       .driverVersion = vk_get_driver_version(),
       .vendorID =
          instance->drirc.debug.force_vk_vendor ? instance->drirc.debug.force_vk_vendor : ARM_VENDOR_ID,
@@ -988,9 +996,8 @@ panvk_per_arch(get_physical_device_properties)(
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
       .timestampComputeAndGraphics =
-         PAN_ARCH >= 10 && device->kmod.dev->props.gpu_can_query_timestamp,
-      .timestampPeriod =
-         PAN_ARCH >= 10 ? panvk_get_gpu_system_timestamp_period(device) : 0,
+         device->kmod.dev->props.gpu_can_query_timestamp,
+      .timestampPeriod = panvk_get_gpu_system_timestamp_period(device),
       .maxClipDistances = 0,
       .maxCullDistances = 0,
       .maxCombinedClipAndCullDistances = 0,

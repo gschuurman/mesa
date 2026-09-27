@@ -74,6 +74,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
          .in_sync_count = nr_in_fences,
          .out_sync = queue->sync,
          .jc = batch->vtc_jc.first_job,
+         .requirements =
+            batch->needs_cycle_count ? PANFROST_JD_REQ_CYCLE_COUNT : 0,
       };
 
       ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
