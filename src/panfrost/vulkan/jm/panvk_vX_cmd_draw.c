@@ -43,6 +43,8 @@
 
 struct panvk_draw_data {
    struct panvk_draw_info info;
+   /* The primitives generated query (if any) already counted this draw. */
+   bool prims_generated_counted;
    unsigned vertex_range;
    unsigned padded_vertex_count;
    struct mali_invocation_packed invocation;
@@ -1445,6 +1447,25 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
    return VK_SUCCESS;
 }
 
+/* Adds the primitives of a draw whose vertex count is known at record time to
+ * the active primitives generated query. */
+static void
+count_prims_generated_cpu(struct panvk_cmd_buffer *cmdbuf, enum mesa_prim prim,
+                          uint32_t vertex_count, uint32_t instance_count)
+{
+   struct panvk_prims_generated_query_state *state =
+      &cmdbuf->state.gfx.prims_generated_query;
+
+   if (!state->ptr)
+      return;
+
+   const uint32_t view_count =
+      MAX2(1, util_bitcount(cmdbuf->state.gfx.render.view_mask));
+
+   state->cpu_count += u_decomposed_prims_for_vertices(prim, vertex_count) *
+                       instance_count * view_count;
+}
+
 static void
 panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
 {
@@ -1463,6 +1484,9 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    result = prepare_draw(cmdbuf, draw);
    if (result != VK_SUCCESS)
       return;
+
+   count_prims_generated_cpu(cmdbuf, draw->info.prim, draw->info.vertex.count,
+                             draw->info.instance.count);
 
    pan_pack_work_groups_compute(&draw->invocation, 1, draw->vertex_range,
                                 draw->info.instance.count, 1, 1, 1, true,
@@ -1538,6 +1562,19 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    struct panvk_batch *batch = cmdbuf->cur_batch;
    const struct vk_vertex_input_state *vi =
       cmdbuf->vk.dynamic_graphics_state.vi;
+
+   /* The vertex count, or the primitive restarts, are only known on the GPU. */
+   if (cmdbuf->state.gfx.prims_generated_query.ptr &&
+       !draw->prims_generated_counted) {
+      const struct panvk_draw_info *info = &draw->info;
+      const bool restart = info->index.index_size && info->index.restart_enable;
+
+      panvk_per_arch(cmd_update_prims_generated_query)(
+         cmdbuf, info->indirect.buffer_dev_addr,
+         restart ? info->index.buffer_dev_addr : 0,
+         restart ? info->index.buffer_size / info->index.index_size : 0,
+         info->index.index_size, info->prim, 0);
+   }
 
    unsigned copy_desc_job_id =
       draw->jobs.vertex_copy_desc.gpu
@@ -1839,6 +1876,14 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
          .prim = panvk_get_client_prim(cmdbuf),
       },
    };
+
+   /* Without primitive restart, the primitive count only depends on the index
+    * count. */
+   if (!draw.info.index.restart_enable) {
+      count_prims_generated_cpu(cmdbuf, draw.info.prim, indexCount,
+                                instanceCount);
+      draw.prims_generated_counted = true;
+   }
 
    panvk_cmd_draw_indirect(cmdbuf, &draw);
 }

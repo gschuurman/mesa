@@ -131,6 +131,7 @@ panlib_copy_query_result(uint64_t pool_addr, global uint32_t *available_addr,
          write_occlusion_query_result(dst, 0, flags, report_addr, report_count);
          break;
       case VK_QUERY_TYPE_TIMESTAMP:
+      case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
          vk_write_query(dst, 0, flags, report_addr[0]);
          break;
       default:

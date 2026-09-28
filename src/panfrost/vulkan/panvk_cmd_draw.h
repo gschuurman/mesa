@@ -156,9 +156,7 @@ struct panvk_cmd_graphics_state {
    } dynamic;
 
    struct panvk_occlusion_query_state occlusion_query;
-#if PAN_ARCH >= 10
    struct panvk_prims_generated_query_state prims_generated_query;
-#endif
    struct panvk_graphics_sysvals sysvals;
 
 #if PAN_ARCH < 9

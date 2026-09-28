@@ -66,10 +66,6 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
       reports_per_query = PANVK_SUBQUEUE_COUNT + 1;
       break;
    }
-   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
-      reports_per_query = 1;
-      break;
-   }
 #else
    case VK_QUERY_TYPE_TIMESTAMP: {
       /* The raw GPU timestamp, written by a WRITE_VALUE job. */
@@ -77,6 +73,10 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
       break;
    }
 #endif
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
+      reports_per_query = 1;
+      break;
+   }
    default:
       UNREACHABLE("Unsupported query type");
    }
@@ -284,11 +284,6 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
                                                 pool->reports_per_query);
             break;
          }
-         case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
-            if (write_results)
-               cpu_write_query_result(dst, 0, flags, src[0].value);
-            break;
-         }
 #else
          case VK_QUERY_TYPE_TIMESTAMP: {
             if (write_results)
@@ -296,6 +291,11 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
             break;
          }
 #endif
+         case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
+            if (write_results)
+               cpu_write_query_result(dst, 0, flags, src[0].value);
+            break;
+         }
          default:
             UNREACHABLE("Unsupported query type");
          }

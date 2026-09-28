@@ -11,6 +11,7 @@
 #endif
 
 #include "genxml/gen_macros.h"
+#include "panvk_macros.h"
 
 struct panvk_occlusion_query_state {
 #if PAN_ARCH >= 10
@@ -20,11 +21,27 @@ struct panvk_occlusion_query_state {
    enum mali_occlusion_mode mode;
 };
 
-#if PAN_ARCH >= 10
 struct panvk_prims_generated_query_state {
+#if PAN_ARCH >= 10
    uint64_t syncobj;
+#endif
    uint64_t ptr;
+#if PAN_ARCH < 10
+   /* Primitives of direct draws, counted on the CPU and added to the report
+    * when the query ends. */
+   uint32_t cpu_count;
+   /* Whether a GPU job added to the report, see the JM EndQuery. */
+   bool gpu_count;
+#endif
 };
+
+#if PAN_ARCH < 10
+struct panvk_cmd_buffer;
+
+void panvk_per_arch(cmd_update_prims_generated_query)(
+   struct panvk_cmd_buffer *cmd, uint64_t draw_cmd, uint64_t index_buffer,
+   uint32_t index_buffer_size_el, uint32_t index_size, unsigned prim,
+   uint32_t cpu_count);
 #endif
 
 #endif

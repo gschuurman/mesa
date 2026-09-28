@@ -152,6 +152,43 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
    close_batch(cmd, had_batch);
 }
 
+/* Adds the primitives of one draw (draw_cmd: a Vk[Indexed]DrawIndirectCommand
+ * in GPU memory, or 0 for none) plus cpu_count to the active primitives
+ * generated query, with a compute job. A non-zero index_buffer means primitive
+ * restart is enabled, so the indices are scanned. Must be called with a batch
+ * open.
+ */
+void
+panvk_per_arch(cmd_update_prims_generated_query)(
+   struct panvk_cmd_buffer *cmd, uint64_t draw_cmd, uint64_t index_buffer,
+   uint32_t index_buffer_size_el, uint32_t index_size, unsigned prim,
+   uint32_t cpu_count)
+{
+   struct panvk_prims_generated_query_state *state =
+      &cmd->state.gfx.prims_generated_query;
+
+   assert(state->ptr && cmd->cur_batch);
+
+   const struct panlib_jm_update_prims_generated_query_args args = {
+      .prims_generated = state->ptr,
+      .cmd = draw_cmd,
+      .index_buffer = index_buffer,
+      .index_buffer_size_el = index_buffer_size_el,
+      .index_bytes = index_size,
+      .prim = prim,
+      .view_count = MAX2(1, util_bitcount(cmd->state.gfx.render.view_mask)),
+      .cpu_count = cpu_count,
+   };
+
+   /* The barrier orders the job after the report reset done when the query
+    * began, and after any earlier job writing the draw parameters. */
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
+   panlib_jm_update_prims_generated_query_struct(
+      &precomp_ctx, panlib_1d(1), PANLIB_BARRIER_JM_BARRIER, args);
+
+   state->gpu_count = true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
                                         VkQueryPool queryPool, uint32_t query,
@@ -197,6 +234,30 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
       }
       break;
    }
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
+      struct panvk_prims_generated_query_state *state =
+         &cmd->state.gfx.prims_generated_query;
+
+      state->ptr = report_addr;
+      state->cpu_count = 0;
+      state->gpu_count = false;
+
+      /* From the Vulkan spec:
+       *
+       *   "When a primitives generated query begins, the count of primitives
+       *    generated starts from zero."
+       *
+       * With multiview, all views count into the first query, the others
+       * stay zero.
+       */
+      const uint32_t n_views =
+         MAX2(1, util_bitcount(cmd->state.gfx.render.view_mask));
+      for (uint32_t q = query; q < query + n_views; q++) {
+         panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64,
+                              panvk_query_report_dev_addr(pool, q), 0);
+      }
+      break;
+   }
    default:
       UNREACHABLE("Unsupported query type");
    }
@@ -230,6 +291,35 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
       cmd->state.gfx.occlusion_query.ptr = 0;
       cmd->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_DISABLED;
       gfx_state_set_dirty(cmd, OQ);
+      break;
+   }
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
+      struct panvk_prims_generated_query_state *state =
+         &cmd->state.gfx.prims_generated_query;
+
+      /* The draws of the query are in previous batches, so they are done.
+       * Add the primitives counted on the CPU: a plain write is enough if no
+       * GPU job added to the report. */
+      if (state->cpu_count) {
+         if (state->gpu_count) {
+            panvk_per_arch(cmd_update_prims_generated_query)(
+               cmd, 0, 0, 0, 0, 0, state->cpu_count);
+         } else {
+            panvk_emit_write_job(cmd, batch,
+                                 MALI_WRITE_VALUE_TYPE_IMMEDIATE_64,
+                                 state->ptr, state->cpu_count);
+         }
+
+         /* The GPU caches are not coherent with the CPU and may write lines
+          * back in any order: flush the report, by ending the batch, before
+          * marking the query available. */
+         panvk_per_arch(cmd_close_batch)(cmd);
+         batch = panvk_per_arch(cmd_open_batch)(cmd);
+      }
+
+      state->ptr = 0;
+      state->cpu_count = 0;
+      state->gpu_count = false;
       break;
    }
    default:
