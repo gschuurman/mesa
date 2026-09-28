@@ -1172,9 +1172,20 @@ bi_instr_schedulable(bi_context *ctx, bi_instr *instr,
    unsigned total_writes = tuple->reg.nr_writes;
    total_writes += bi_write_count(instr, live_after_temp);
 
-   /* Last tuple in a clause can only write a single value */
-   if (tuple->last && total_writes > 1)
-      return false;
+   /* Last tuple in a clause can only write a single value. Count every
+    * register destination there, not only the live ones: the packing
+    * (bi_assign_slots) writes a destination even when it is only read through
+    * the passthrough, and two writes in the last tuple are not encodable
+    * (INSTR_INVALID_ENC). */
+   if (tuple->last) {
+      unsigned last_writes = bi_write_count(instr, ~0ull);
+
+      if (tuple->add)
+         last_writes += bi_write_count(tuple->add, ~0ull);
+
+      if (last_writes > 1)
+         return false;
+   }
 
    /* Register file reads are limited, so count unique */
 
