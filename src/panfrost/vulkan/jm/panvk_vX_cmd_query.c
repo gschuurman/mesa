@@ -145,6 +145,15 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
    for (uint32_t q = query; q < query + n_views; q++) {
       panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
                            panvk_query_report_dev_addr(pool, q), 0);
+   }
+
+   /* The GPU caches are not coherent with the CPU and may write lines back in
+    * any order: flush the timestamps, by ending the batch, before marking the
+    * queries available. */
+   panvk_per_arch(cmd_close_batch)(cmd);
+   batch = panvk_per_arch(cmd_open_batch)(cmd);
+
+   for (uint32_t q = query; q < query + n_views; q++) {
       panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
                            panvk_query_available_dev_addr(pool, q), 1);
    }
