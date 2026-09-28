@@ -202,6 +202,7 @@ panvk_per_arch(get_physical_device_extensions)(
 #endif
       .EXT_private_data = true,
       .EXT_primitive_topology_list_restart = true,
+      .EXT_primitives_generated_query = PAN_ARCH == 7,
       .EXT_provoking_vertex = true,
       .EXT_queue_family_foreign = true,
       .EXT_rasterization_order_attachment_access = PAN_ARCH >= 10,
@@ -602,6 +603,12 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_EXT_transform_feedback: emulated on v7, see panvk_xfb.h */
       .transformFeedback = PAN_ARCH == 7,
       .geometryStreams = false,
+
+      /* VK_EXT_primitives_generated_query: implemented on JM, and on CSF,
+       * but it depends on VK_EXT_transform_feedback. */
+      .primitivesGeneratedQuery = PAN_ARCH == 7,
+      .primitivesGeneratedQueryWithRasterizerDiscard = PAN_ARCH == 7,
+      .primitivesGeneratedQueryWithNonZeroStreams = false,
 
       /* VK_EXT_provoking_vertex */
       .provokingVertexLast = true,
