@@ -608,8 +608,14 @@ panvk_draw_emit_attrib(const struct panvk_draw_data *draw,
          helper_attrib_info->stride = per_instance ? buf_info->stride : 0;
       } else {
          cfg.offset = offset;
-         if (per_instance)
+         if (per_instance) {
             cfg.offset += draw->info.instance.base * buf_info->stride;
+
+            /* For instanced draws, the hardware also offsets per-instance
+             * data by offset_start (the raw vertex offset), compensate. */
+            if (draw->info.instance.count > 1)
+               cfg.offset -= draw->info.vertex.raw_offset * buf_info->stride;
+         }
       }
    }
 }
