@@ -10,6 +10,7 @@
 #include "lib/pan_encoder.h"
 #include "poly/cl/restart.h"
 #include "draw_helper.h"
+#include "vulkan/panvk_xfb.h"
 
 #if PAN_ARCH >= 10
 
@@ -714,6 +715,256 @@ panlib_jm_update_prims_generated_query(global atomic_uint *prims_generated,
    }
 
    atomic_fetch_add(prims_generated, count);
+}
+
+/* Transform feedback (see vulkan/panvk_xfb.h). The counter buffers hold the
+ * bytes written to each buffer; 0 means no counter buffer. */
+KERNEL(1)
+panlib_jm_xfb_begin(global struct panvk_xfb_offsets *offsets,
+                    uint64_t counter0, uint64_t counter1, uint64_t counter2,
+                    uint64_t counter3)
+{
+   uint64_t counters[PANVK_XFB_MAX_BUFFERS] = {counter0, counter1, counter2,
+                                               counter3};
+
+   for (unsigned i = 0; i < PANVK_XFB_MAX_BUFFERS; i++) {
+      uint32_t bytes = 0;
+
+      if (counters[i])
+         bytes = *(global uint32_t *)counters[i];
+
+      offsets->bytes[i] = bytes;
+   }
+}
+
+KERNEL(1)
+panlib_jm_xfb_end(global struct panvk_xfb_offsets *offsets,
+                  uint64_t counter0, uint64_t counter1, uint64_t counter2,
+                  uint64_t counter3)
+{
+   uint64_t counters[PANVK_XFB_MAX_BUFFERS] = {counter0, counter1, counter2,
+                                               counter3};
+
+   for (unsigned i = 0; i < PANVK_XFB_MAX_BUFFERS; i++) {
+      if (counters[i])
+         *(global uint32_t *)counters[i] = offsets->bytes[i];
+   }
+}
+
+/* Vertex of the draw (0 = first) for vertex k of primitive p. Same as
+ * xfb_decompose() in panvk_vX_shader.c. */
+static uint32_t
+xfb_decompose(enum mesa_prim prim, uint32_t p, uint32_t k)
+{
+   uint32_t strip_k = (p & 1) && k < 2 ? 1 - k : k;
+
+   switch (prim) {
+   case MESA_PRIM_LINES:
+      return 2 * p + k;
+   case MESA_PRIM_LINE_STRIP:
+      return p + k;
+   case MESA_PRIM_LINES_ADJACENCY:
+      return 4 * p + k + 1;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return p + k + 1;
+   case MESA_PRIM_TRIANGLES:
+      return 3 * p + k;
+   case MESA_PRIM_TRIANGLE_STRIP:
+      return p + strip_k;
+   case MESA_PRIM_TRIANGLE_FAN:
+      return k == 2 ? 0 : p + k + 1;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      return 6 * p + 2 * k;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return 2 * p + 2 * strip_k;
+   default:
+      return p;
+   }
+}
+
+static uint32_t
+xfb_load_index(global struct panvk_xfb_params *params, uint32_t el)
+{
+   if (el >= params->index_buffer_size_el)
+      return 0;
+
+   switch (params->index_size) {
+   case 1:
+      return ((global uint8_t *)params->index_buffer)[el];
+   case 2:
+      return ((global uint16_t *)params->index_buffer)[el];
+   default:
+      return ((global uint32_t *)params->index_buffer)[el];
+   }
+}
+
+/* Primitive restart: writes the index of each captured vertex to the vertex
+ * list, one restart-free segment at a time, and returns the primitive count.
+ * Primitives that don't fit in the list are dropped. */
+static uint32_t
+xfb_expand_restart(global struct panvk_xfb_params *params, uint32_t first,
+                   uint32_t count)
+{
+   global uint32_t *list = (global uint32_t *)params->vertex_list;
+   enum mesa_prim prim = (enum mesa_prim)params->prim;
+   uint32_t vpp = params->verts_per_prim;
+   uint32_t restart_index =
+      params->index_size == 4 ? UINT32_MAX
+                              : (1u << (params->index_size * 8)) - 1;
+   uint32_t prims = 0, out = 0, start = 0;
+
+   for (uint32_t i = 0; i <= count; i++) {
+      if (i < count && xfb_load_index(params, first + i) != restart_index)
+         continue;
+
+      uint32_t seg_prims = u_decomposed_prims_for_vertices(prim, i - start);
+      for (uint32_t p = 0; p < seg_prims; p++) {
+         if (out + vpp > params->vertex_list_size_el)
+            return prims;
+
+         for (uint32_t k = 0; k < vpp; k++) {
+            list[out++] = xfb_load_index(
+               params, first + start + xfb_decompose(prim, p, k));
+         }
+         prims++;
+      }
+
+      start = i + 1;
+   }
+
+   return prims;
+}
+
+/* For an indirect or indexed draw: fills the parameters only known on the
+ * GPU, and patches the XFB job like panlib_patch_draw_vertex_dcd() patches
+ * the draw's vertex job (the XFB job uses the same attribute descriptors).
+ * cmd is a Vk[Indexed]DrawIndirectCommand; index_min_max is only set for
+ * indexed draws. Runs after the draw helper.
+ *
+ * When the draw has no vertex job (the vertex shader only feeds transform
+ * feedback), the draw helper did not run, so the attribute descriptors are
+ * patched here (attrib_bufs_valid/attribs_valid are 0 otherwise). */
+KERNEL(1)
+panlib_jm_xfb_patch(
+   global struct panvk_xfb_params *params, constant uint32_t *cmd,
+   constant struct libpan_draw_helper_index_min_max_result *index_min_max,
+   global uint8_t *xfb_job,
+   global struct mali_attribute_buffer_packed *attrib_bufs_descs,
+   global struct libpan_draw_helper_attrib_buf_info *attrib_bufs_infos,
+   global struct mali_attribute_packed *attribs_descs,
+   global struct libpan_draw_helper_attrib_info *attribs_infos, uint32_t idvs,
+   uint32_t attrib_bufs_valid, uint32_t attribs_valid)
+{
+   uint32_t count = cmd[0];
+   uint32_t instance_count = cmd[1];
+   uint32_t first = cmd[2];
+   int32_t vertex_offset = 0;
+   int32_t raw_offset = first;
+   uint32_t vertex_range = count;
+
+   /* VkDrawIndirectCommand::firstInstance, or the indexed one's */
+   params->base_instance = cmd[3];
+   params->base_vertex = first;
+
+   if (params->index_size) {
+      vertex_offset = (int32_t)cmd[3];
+      raw_offset = index_min_max->min + vertex_offset;
+      vertex_range = index_min_max->max - index_min_max->min + 1;
+      params->base_instance = cmd[4];
+      params->base_vertex = vertex_offset;
+   }
+
+   uint32_t prims =
+      params->vertex_list
+         ? xfb_expand_restart(params, first, count)
+         : u_decomposed_prims_for_vertices((enum mesa_prim)params->prim, count);
+
+   params->vertex_count = count;
+   params->instance_count = instance_count;
+   params->first = first;
+   params->vertex_offset = vertex_offset;
+   params->raw_offset = raw_offset;
+   params->prims_per_instance = prims;
+
+   bool is_null_job = prims == 0 || instance_count == 0 ||
+                      index_min_max && index_min_max->min > index_min_max->max;
+   panlib_patch_job_type_header((global struct mali_job_header_packed *)xfb_job,
+                                is_null_job ? MALI_JOB_TYPE_NULL
+                                            : MALI_JOB_TYPE_VERTEX);
+   if (is_null_job) {
+      params->prims_per_instance = 0;
+      return;
+   }
+
+   global struct mali_invocation_packed *invocation =
+      (global struct mali_invocation_packed *)(xfb_job +
+                                               pan_section_offset(COMPUTE_JOB,
+                                                                  INVOCATION));
+   global struct mali_draw_packed *dcd =
+      (global struct mali_draw_packed *)(xfb_job +
+                                         pan_section_offset(COMPUTE_JOB, DRAW));
+
+   uint32_t padded =
+      padded_vertex_count(vertex_range, instance_count, idvs);
+
+   pan_pack_work_groups_compute(invocation, 1, prims * params->verts_per_prim,
+                                instance_count, 1, 1, 1, true, false);
+
+   pan_unpack(dcd, DRAW, unpacked_dcd)
+      ;
+   pan_pack(dcd, DRAW, cfg) {
+      memcpy(&cfg, &unpacked_dcd, sizeof(cfg));
+      cfg.offset_start = raw_offset;
+      cfg.instance_size = instance_count > 1 ? padded : 1;
+   }
+
+   struct panlib_draw_info draw = {
+      .vertex.raw_offset = raw_offset,
+      .instance.base = params->base_instance,
+      .instance.count = instance_count,
+      .padded_vertex_count = padded,
+   };
+
+   uint32_t num_vbs = util_last_bit(attrib_bufs_valid);
+   for (uint32_t i = 0; i < num_vbs; i++) {
+      if (attrib_bufs_valid & BITFIELD_BIT(i))
+         panlib_patch_attrib_buf(&draw, &attrib_bufs_descs[i * 2],
+                                 attrib_bufs_infos[i]);
+   }
+
+   uint32_t num_attribs = util_last_bit(attribs_valid);
+   for (uint32_t i = 0; i < num_attribs; i++) {
+      if (attribs_valid & BITFIELD_BIT(i))
+         panlib_patch_attrib(&draw, &attribs_descs[i], attribs_infos[i]);
+   }
+}
+
+/* After the XFB job of a draw: advance the offsets by the primitives that
+ * were written, i.e. the ones that fit in all the buffers (see the XFB
+ * variant in panvk_vX_shader.c). */
+KERNEL(1)
+panlib_jm_xfb_advance(constant struct panvk_xfb_params *params)
+{
+   global struct panvk_xfb_offsets *offsets =
+      (global struct panvk_xfb_offsets *)params->offsets;
+   uint32_t vpp = params->verts_per_prim;
+   uint32_t prims = params->prims_per_instance * params->instance_count;
+
+   for (unsigned i = 0; i < PANVK_XFB_MAX_BUFFERS; i++) {
+      uint32_t stride = params->stride[i];
+      if (!stride)
+         continue;
+
+      uint32_t written = offsets->bytes[i];
+      uint32_t size = params->buffer_size[i];
+      uint32_t room = written < size ? size - written : 0;
+      prims = min(prims, room / (stride * vpp));
+   }
+
+   for (unsigned i = 0; i < PANVK_XFB_MAX_BUFFERS; i++) {
+      if (params->stride[i])
+         offsets->bytes[i] += prims * vpp * params->stride[i];
+   }
 }
 
 #endif

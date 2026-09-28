@@ -19,6 +19,7 @@
 #include "panvk_physical_device.h"
 #include "panvk_sampler.h"
 #include "panvk_shader.h"
+#include "panvk_xfb.h"
 
 #include "spirv/nir_spirv.h"
 #include "util/memstream.h"
@@ -28,6 +29,7 @@
 #include "nir_builder.h"
 #include "nir_conversion_builder.h"
 #include "nir_deref.h"
+#include "nir_xfb_info.h"
 
 #include "shader_enums.h"
 #include "vk_graphics_state.h"
@@ -98,6 +100,11 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
 #if PAN_ARCH < 9
    case nir_intrinsic_load_raw_vertex_offset_pan:
       val = load_sysval(b, graphics, bit_size, vs.raw_vertex_offset);
+      break;
+   case nir_intrinsic_load_xfb_address:
+      /* The XFB variant uses it for the struct panvk_xfb_params address. */
+      assert(b->shader->info.stage == MESA_SHADER_VERTEX);
+      val = load_sysval(b, graphics, bit_size, vs.xfb_params);
       break;
    case nir_intrinsic_load_layer_id:
       assert(b->shader->info.stage == MESA_SHADER_FRAGMENT);
@@ -219,6 +226,268 @@ panvk_lower_load_vs_input(nir_builder *b, nir_intrinsic_instr *intrin,
 }
 
 #if PAN_ARCH < 9
+/* Transform feedback variant of a vertex shader (see panvk_xfb.h). It runs as
+ * a compute job with one invocation per captured vertex: the raw vertex ID is
+ * the vertex slot in the decomposed primitive list of one instance, and the
+ * instance ID is the instance. From the slot we find the vertex of the draw
+ * (topology, index buffer), run the shader for it, and store the XFB outputs
+ * instead of writing varyings.
+ *
+ * The job uses the attribute descriptors of the draw, which address vertices
+ * relative to DRAW::offset_start (and wrap on the padded vertex count for
+ * instanced draws), so the vertex is passed as a raw vertex ID: relative to
+ * panvk_xfb_params::raw_offset, like in the draw's vertex job.
+ */
+
+struct panvk_xfb_lower_ctx {
+   const nir_xfb_info *xfb;
+   nir_def *slot;
+   nir_def *vertex;
+   nir_def *raw_offset;
+   nir_def *base_vertex;
+   nir_def *base_instance;
+   nir_def *prim_idx;
+   nir_def *vert_in_prim;
+   nir_def *verts_per_prim;
+   nir_def *write;
+   nir_def *buffer_addr[PANVK_XFB_MAX_BUFFERS];
+};
+
+#define xfb_param(b, params, field, bits)                                      \
+   nir_load_global(b, 1, bits,                                                 \
+                   nir_iadd_imm(b, params,                                     \
+                                offsetof(struct panvk_xfb_params, field)),     \
+                   .align_mul = (bits) / 8,                                    \
+                   .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER)
+
+/* Vertex of the draw (0 = first) for vertex k of primitive p. Vulkan order,
+ * provoking vertex first. */
+static nir_def *
+xfb_decompose(nir_builder *b, nir_def *prim, nir_def *p, nir_def *k)
+{
+   nir_def *odd = nir_i2b(b, nir_iand_imm(b, p, 1));
+   /* Odd triangles of a strip swap their first two vertices. */
+   nir_def *strip_k =
+      nir_bcsel(b, odd, nir_bcsel(b, nir_ieq_imm(b, k, 0), nir_imm_int(b, 1),
+                                  nir_bcsel(b, nir_ieq_imm(b, k, 1),
+                                            nir_imm_int(b, 0), k)),
+                k);
+
+   struct {
+      enum mesa_prim prim;
+      nir_def *vertex;
+   } cases[] = {
+      {MESA_PRIM_POINTS, p},
+      {MESA_PRIM_LINES, nir_iadd(b, nir_imul_imm(b, p, 2), k)},
+      {MESA_PRIM_LINE_STRIP, nir_iadd(b, p, k)},
+      {MESA_PRIM_LINES_ADJACENCY,
+       nir_iadd(b, nir_imul_imm(b, p, 4), nir_iadd_imm(b, k, 1))},
+      {MESA_PRIM_LINE_STRIP_ADJACENCY, nir_iadd(b, p, nir_iadd_imm(b, k, 1))},
+      {MESA_PRIM_TRIANGLES, nir_iadd(b, nir_imul_imm(b, p, 3), k)},
+      {MESA_PRIM_TRIANGLE_STRIP, nir_iadd(b, p, strip_k)},
+      /* Triangle i of a fan is (i + 1, i + 2, 0). */
+      {MESA_PRIM_TRIANGLE_FAN,
+       nir_bcsel(b, nir_ieq_imm(b, k, 2), nir_imm_int(b, 0),
+                 nir_iadd(b, p, nir_iadd_imm(b, k, 1)))},
+      {MESA_PRIM_TRIANGLES_ADJACENCY,
+       nir_iadd(b, nir_imul_imm(b, p, 6), nir_imul_imm(b, k, 2))},
+      /* Triangle i of a strip with adjacency is (2i, 2i + 2, 2i + 4), with
+       * the first two swapped for odd triangles. */
+      {MESA_PRIM_TRIANGLE_STRIP_ADJACENCY,
+       nir_iadd(b, nir_imul_imm(b, p, 2), nir_imul_imm(b, strip_k, 2))},
+   };
+
+   nir_def *vertex = p;
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+      vertex = nir_bcsel(b, nir_ieq_imm(b, prim, cases[i].prim),
+                         cases[i].vertex, vertex);
+   }
+
+   return vertex;
+}
+
+/* Reads index el of the index buffer, 0 when out of bounds or for a
+ * non-indexed draw. */
+static nir_def *
+xfb_load_index(nir_builder *b, nir_def *params, nir_def *el,
+               nir_def *index_size)
+{
+   nir_def *ib = xfb_param(b, params, index_buffer, 64);
+   nir_def *size_el = xfb_param(b, params, index_buffer_size_el, 32);
+   nir_def *in_bounds = nir_ult(b, el, size_el);
+
+   /* Load the aligned word holding the index, from a valid address even when
+    * the index is not used (out of bounds, or no index buffer at all). */
+   nir_def *safe_el = nir_bcsel(b, in_bounds, el, nir_imm_int(b, 0));
+   nir_def *addr = nir_iadd(b, ib, nir_u2u64(b, nir_imul(b, safe_el,
+                                                          index_size)));
+   addr = nir_bcsel(b, nir_ine_imm(b, ib, 0), addr, params);
+   nir_def *word = nir_load_global(b, 1, 32,
+                                   nir_iand_imm(b, addr, ~(uint64_t)3),
+                                   .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   nir_def *shift = nir_imul_imm(b, nir_u2u32(b, nir_iand_imm(b, addr, 3)), 8);
+   nir_def *mask = nir_bcsel(
+      b, nir_ieq_imm(b, index_size, 4), nir_imm_int(b, ~0),
+      nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1),
+                               nir_imul_imm(b, index_size, 8)), -1));
+   nir_def *index = nir_iand(b, nir_ushr(b, word, shift), mask);
+
+   return nir_bcsel(b, in_bounds, index, nir_imm_int(b, 0));
+}
+
+static bool
+panvk_lower_xfb_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
+                          void *data)
+{
+   struct panvk_xfb_lower_ctx *ctx = data;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_raw_vertex_id_pan:
+      /* The slot, loaded once at the start, stays the hardware value. */
+      if (&intr->def == ctx->slot)
+         return false;
+      nir_def_replace(&intr->def, ctx->vertex);
+      return true;
+
+   case nir_intrinsic_load_vertex_id:
+      nir_def_replace(&intr->def, nir_iadd(b, ctx->vertex, ctx->raw_offset));
+      return true;
+
+   case nir_intrinsic_load_raw_vertex_offset_pan:
+      /* From the params: patched with the draw's for indexed draws. */
+      nir_def_replace(&intr->def, ctx->raw_offset);
+      return true;
+
+   case nir_intrinsic_load_first_vertex:
+      nir_def_replace(&intr->def, ctx->base_vertex);
+      return true;
+
+   case nir_intrinsic_load_base_instance:
+      nir_def_replace(&intr->def, ctx->base_instance);
+      return true;
+
+   case nir_intrinsic_store_output: {
+      nir_io_xfb xfb = nir_intrinsic_io_xfb(intr);
+      unsigned comp = nir_intrinsic_component(intr);
+      nir_def *src = intr->src[0].ssa;
+
+      nir_push_if(b, ctx->write);
+      for (unsigned i = 0; i < 4; i++) {
+         if (!xfb.out[i].num_components)
+            continue;
+
+         unsigned buffer = xfb.out[i].buffer;
+         unsigned stride = ctx->xfb->buffers[buffer].stride;
+         assert(i >= comp && stride);
+
+         /* Vertex slot in the buffer, relative to the current offset. */
+         nir_def *vertex_idx =
+            nir_iadd(b, nir_imul(b, ctx->prim_idx, ctx->verts_per_prim),
+                     ctx->vert_in_prim);
+         nir_def *offset = nir_iadd_imm(b, nir_imul_imm(b, vertex_idx, stride),
+                                        xfb.out[i].offset * 4);
+         nir_def *value = nir_channels(
+            b, src, nir_component_mask(xfb.out[i].num_components) << (i - comp));
+
+         nir_store_global(b, value,
+                          nir_iadd(b, ctx->buffer_addr[buffer],
+                                   nir_u2u64(b, offset)),
+                          .align_mul = 4);
+      }
+      nir_pop_if(b, NULL);
+
+      /* No varyings: the job has no varying buffers. */
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   default:
+      return false;
+   }
+}
+
+static bool
+panvk_lower_xfb_variant(nir_shader *nir)
+{
+   const nir_xfb_info *xfb = nir->xfb_info;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   struct panvk_xfb_lower_ctx ctx = {.xfb = xfb};
+
+   nir_def *params = nir_load_xfb_address(&b, 64, .base = 0);
+   ctx.slot = nir_load_raw_vertex_id_pan(&b);
+   nir_def *instance = nir_load_instance_id(&b);
+
+   nir_def *prim = xfb_param(&b, params, prim, 32);
+   ctx.verts_per_prim = xfb_param(&b, params, verts_per_prim, 32);
+   nir_def *prims_per_instance = xfb_param(&b, params, prims_per_instance, 32);
+   nir_def *first = xfb_param(&b, params, first, 32);
+   nir_def *index_size = xfb_param(&b, params, index_size, 32);
+
+   nir_def *p = nir_udiv(&b, ctx.slot, ctx.verts_per_prim);
+   ctx.vert_in_prim = nir_umod(&b, ctx.slot, ctx.verts_per_prim);
+
+   /* Vertex of the draw, absolute (like gl_VertexIndex), then raw. */
+   nir_def *local = xfb_decompose(&b, prim, p, ctx.vert_in_prim);
+   nir_def *el = nir_iadd(&b, first, local);
+   nir_def *index = xfb_load_index(&b, params, el, index_size);
+
+   /* With primitive restart, the vertex list has the index of each slot. The
+    * load uses a valid address (the params) when there is no list. */
+   nir_def *list = xfb_param(&b, params, vertex_list, 64);
+   nir_def *has_list = nir_ine_imm(&b, list, 0);
+   nir_def *list_addr =
+      nir_bcsel(&b, has_list,
+                nir_iadd(&b, list, nir_u2u64(&b, nir_imul_imm(&b, ctx.slot, 4))),
+                params);
+   nir_def *list_index =
+      nir_load_global(&b, 1, 32, list_addr, .align_mul = 4,
+                      .access = ACCESS_NON_WRITEABLE);
+   index = nir_bcsel(&b, has_list, list_index, index);
+
+   nir_def *indexed_vertex =
+      nir_iadd(&b, index, xfb_param(&b, params, vertex_offset, 32));
+   nir_def *vertex = nir_bcsel(&b, nir_ieq_imm(&b, index_size, 0), el,
+                               indexed_vertex);
+   ctx.raw_offset = xfb_param(&b, params, raw_offset, 32);
+   ctx.base_vertex = xfb_param(&b, params, base_vertex, 32);
+   ctx.base_instance = xfb_param(&b, params, base_instance, 32);
+   ctx.vertex = nir_isub(&b, vertex, ctx.raw_offset);
+
+   /* Primitive index in the capture, and room left in the buffers: a
+    * primitive is only written if it fits in all of them. */
+   ctx.prim_idx =
+      nir_iadd(&b, nir_imul(&b, instance, prims_per_instance), p);
+
+   nir_def *offsets = xfb_param(&b, params, offsets, 64);
+   nir_def *max_prims = nir_imm_int(&b, UINT32_MAX);
+   for (unsigned i = 0; i < PANVK_XFB_MAX_BUFFERS; i++) {
+      if (!(xfb->buffers_written & BITFIELD_BIT(i)))
+         continue;
+
+      nir_def *written = nir_load_global(
+         &b, 1, 32,
+         nir_iadd_imm(&b, offsets, offsetof(struct panvk_xfb_offsets, bytes[i])),
+         .align_mul = 4);
+      nir_def *size = xfb_param(&b, params, buffer_size[i], 32);
+      nir_def *room =
+         nir_bcsel(&b, nir_ult(&b, written, size), nir_isub(&b, size, written),
+                   nir_imm_int(&b, 0));
+      nir_def *fit = nir_udiv(
+         &b, room, nir_imul_imm(&b, ctx.verts_per_prim, xfb->buffers[i].stride));
+      max_prims = nir_umin(&b, max_prims, fit);
+
+      ctx.buffer_addr[i] = nir_iadd(&b, xfb_param(&b, params, buffer_addr[i], 64),
+                                    nir_u2u64(&b, written));
+   }
+   ctx.write = nir_ult(&b, ctx.prim_idx, max_prims);
+
+   return nir_shader_intrinsics_pass(nir, panvk_lower_xfb_intrinsic,
+                                     nir_metadata_none, &ctx);
+}
+
 static bool
 lower_gl_pos_layer_writes(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -1386,6 +1655,60 @@ panvk_compile_shader(struct panvk_device *dev,
 
    switch (info->stage) {
    case MESA_SHADER_VERTEX: {
+#if PAN_ARCH < 9
+      /* The XFB variant, only when the shader captures outputs. It gets its
+       * own copy of the NIR; the HW variant below uses the original. */
+      if (info->nir->xfb_info) {
+         struct panvk_shader_variant *variant =
+            &shader->variants[PANVK_VS_VARIANT_XFB];
+         nir_shader *nir = nir_shader_clone(NULL, info->nir);
+
+         panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
+                         info->robustness, state, &shader->desc_info, false);
+
+         nir_foreach_shader_in_variable(var, nir) {
+            var->data.driver_location =
+               var->data.location - VERT_ATTRIB_GENERIC0;
+         }
+         nir_assign_io_var_locations(nir, nir_var_shader_out);
+         panvk_lower_nir_io(nir);
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
+
+         /* Attribute loads must use the vertex computed from the slot. */
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, panvk_lower_load_vs_input,
+                  nir_metadata_control_flow, NULL);
+         NIR_PASS(_, nir, panvk_lower_xfb_variant);
+
+         for (unsigned i = 0; i < PANVK_XFB_MAX_BUFFERS; i++) {
+            if (nir->xfb_info->buffers_written & BITFIELD_BIT(i))
+               variant->vs.xfb_stride[i] = nir->xfb_info->buffers[i].stride;
+         }
+
+         struct pan_compile_inputs xfb_inputs = inputs;
+         xfb_inputs.no_idvs = true;
+         xfb_inputs.trust_varying_flat_highp_types = true;
+
+         /* No varyings left: the outputs are stored to the XFB buffers. */
+         struct pan_varying_layout xfb_varying_layout;
+         pan_varying_collect_formats(&xfb_varying_layout, nir,
+                                     xfb_inputs.gpu_id, true, true);
+         pan_build_varying_layout_compact(&xfb_varying_layout, nir,
+                                          xfb_inputs.gpu_id);
+         xfb_inputs.varying_layout = &xfb_varying_layout;
+
+         variant->own_bin = true;
+         result = panvk_compile_nir(dev, nir, info->flags, &xfb_inputs, state,
+                                    NULL, &shader->desc_info, variant);
+         ralloc_free(nir);
+
+         if (result != VK_SUCCESS) {
+            panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+            return result;
+         }
+      }
+#endif
+
       const enum panvk_vs_variant last_variant = PANVK_VS_VARIANT_HW;
       for (enum panvk_vs_variant v = 0; v <= last_variant; v++) {
          struct panvk_shader_variant *variant = &shader->variants[v];
@@ -1817,6 +2140,11 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
                       sizeof(shader->cs.local_size));
       break;
 
+   case MESA_SHADER_VERTEX:
+      blob_copy_bytes(blob, &shader->vs.xfb_stride,
+                      sizeof(shader->vs.xfb_stride));
+      break;
+
    case MESA_SHADER_FRAGMENT:
       shader->fs.earlyzs_lut = pan_earlyzs_analyze(&shader->info, PAN_ARCH);
       blob_copy_bytes(blob, &shader->fs.input_attachment_read,
@@ -1838,12 +2166,15 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
    if (blob->overrun)
       return panvk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
-   shader->bin_ptr = malloc(shader->bin_size);
-   if (shader->bin_ptr == NULL)
-      return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   /* Variants that were not compiled (e.g. XFB) have no binary. */
+   if (shader->bin_size) {
+      shader->bin_ptr = malloc(shader->bin_size);
+      if (shader->bin_ptr == NULL)
+         return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   shader->own_bin = true;
-   blob_copy_bytes(blob, (void *)shader->bin_ptr, shader->bin_size);
+      shader->own_bin = true;
+      blob_copy_bytes(blob, (void *)shader->bin_ptr, shader->bin_size);
+   }
 
    uint32_t nir_str_size = blob_read_uint32(blob);
    uint32_t asm_str_size = blob_read_uint32(blob);
@@ -1964,6 +2295,11 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
    case MESA_SHADER_KERNEL:
       blob_write_bytes(blob, &shader->cs.local_size,
                        sizeof(shader->cs.local_size));
+      break;
+
+   case MESA_SHADER_VERTEX:
+      blob_write_bytes(blob, &shader->vs.xfb_stride,
+                       sizeof(shader->vs.xfb_stride));
       break;
 
    case MESA_SHADER_FRAGMENT:

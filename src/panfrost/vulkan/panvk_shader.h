@@ -154,6 +154,10 @@ struct panvk_graphics_sysvals {
       int32_t first_vertex;
       int32_t base_instance;
       uint32_t noperspective_varyings;
+#if PAN_ARCH < 9
+      /* struct panvk_xfb_params of the draw, read by the XFB variant. */
+      aligned_u64 xfb_params;
+#endif
    } vs;
 
    struct {
@@ -396,6 +400,11 @@ struct panvk_shader_variant {
          bool tile_image_z_read;
          bool tile_image_s_read;
       } fs;
+
+      struct {
+         /* XFB variant: stride of each XFB buffer in bytes, 0 if unused. */
+         uint32_t xfb_stride[4];
+      } vs;
    };
 
    struct panvk_shader_fau_info fau;
@@ -432,6 +441,12 @@ enum panvk_vs_variant {
    /* Hardware vertex shader, when next stage is fragment */
    PANVK_VS_VARIANT_HW,
 
+#if PAN_ARCH < 9
+   /* Transform feedback: run as a compute job over the captured vertices.
+    * Only compiled (bin_size != 0) when the shader has XFB outputs. */
+   PANVK_VS_VARIANT_XFB,
+#endif
+
    PANVK_VS_VARIANTS,
 };
 
@@ -454,6 +469,9 @@ panvk_shader_num_variants(mesa_shader_stage stage)
 
 static const char *panvk_vs_shader_variant_name[] = {
    [PANVK_VS_VARIANT_HW] = NULL,
+#if PAN_ARCH < 9
+   [PANVK_VS_VARIANT_XFB] = "XFB",
+#endif
 };
 
 static const char *
@@ -491,6 +509,19 @@ panvk_shader_hw_variant(const struct panvk_shader *shader)
 
    return &shader->variants[0];
 }
+
+#if PAN_ARCH < 9
+/* The XFB variant, or NULL if the shader has no XFB outputs. */
+static inline const struct panvk_shader_variant *
+panvk_shader_xfb_variant(const struct panvk_shader *shader)
+{
+   if (!shader || shader->vk.stage != MESA_SHADER_VERTEX ||
+       !shader->variants[PANVK_VS_VARIANT_XFB].bin_size)
+      return NULL;
+
+   return &shader->variants[PANVK_VS_VARIANT_XFB];
+}
+#endif
 
 static inline uint64_t
 panvk_shader_variant_get_dev_addr(const struct panvk_shader_variant *shader)

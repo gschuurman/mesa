@@ -92,6 +92,7 @@ jm_files = [
   'jm/panvk_vX_cmd_draw.c',
   'jm/panvk_vX_cmd_event.c',
   'jm/panvk_vX_cmd_query.c',
+  'jm/panvk_vX_cmd_xfb.c',
   'jm/panvk_vX_cmd_precomp.c',
   'jm/panvk_vX_event.c',
   'jm/panvk_vX_gpu_queue.c',

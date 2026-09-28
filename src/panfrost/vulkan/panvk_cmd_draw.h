@@ -13,6 +13,7 @@
 #include "panvk_blend.h"
 #include "panvk_cmd_desc_state.h"
 #include "panvk_cmd_query.h"
+#include "panvk_xfb.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
 #include "panvk_image_view.h"
@@ -216,6 +217,19 @@ struct panvk_cmd_graphics_state {
       uint64_t size;
       uint8_t index_size;
    } ib;
+
+#if PAN_ARCH < 9
+   /* Transform feedback (emulated, see panvk_xfb.h) */
+   struct {
+      struct {
+         uint64_t addr;
+         uint32_t size;
+      } buffers[PANVK_XFB_MAX_BUFFERS];
+
+      /* struct panvk_xfb_offsets while transform feedback is active, else 0 */
+      uint64_t offsets;
+   } xfb;
+#endif
 
    struct {
       struct panvk_blend_info info;

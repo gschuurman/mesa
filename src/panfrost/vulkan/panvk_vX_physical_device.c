@@ -228,6 +228,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_astc_decode_mode = PAN_ARCH >= 9,
       .EXT_texture_compression_astc_hdr = true,
       .EXT_tooling_info = true,
+      .EXT_transform_feedback = PAN_ARCH == 7,
       .EXT_vertex_attribute_divisor = true,
       .EXT_vertex_input_dynamic_state = true,
       .EXT_ycbcr_2plane_444_formats = PAN_ARCH >= 10,
@@ -597,6 +598,10 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_EXT_primitive_topology_list_restart */
       .primitiveTopologyListRestart = true,
       .primitiveTopologyPatchListRestart = false,
+
+      /* VK_EXT_transform_feedback: emulated on v7, see panvk_xfb.h */
+      .transformFeedback = PAN_ARCH == 7,
+      .geometryStreams = false,
 
       /* VK_EXT_provoking_vertex */
       .provokingVertexLast = true,
@@ -1282,6 +1287,18 @@ panvk_per_arch(get_physical_device_properties)(
       /* VK_EXT_provoking_vertex */
       .provokingVertexModePerPipeline = false,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+
+      /* VK_EXT_transform_feedback */
+      .maxTransformFeedbackStreams = 1,
+      .maxTransformFeedbackBuffers = PANVK_XFB_MAX_BUFFERS,
+      .maxTransformFeedbackBufferSize = UINT32_MAX,
+      .maxTransformFeedbackStreamDataSize = 512,
+      .maxTransformFeedbackBufferDataSize = 512,
+      .maxTransformFeedbackBufferDataStride = 2048,
+      .transformFeedbackQueries = false,
+      .transformFeedbackStreamsLinesTriangles = false,
+      .transformFeedbackRasterizationStreamSelect = false,
+      .transformFeedbackDraw = false,
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageCoherentReadAccelerated = PAN_ARCH >= 9,

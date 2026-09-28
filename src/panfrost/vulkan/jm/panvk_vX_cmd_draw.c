@@ -1453,6 +1453,194 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
    return VK_SUCCESS;
 }
 
+/* Vertices of the primitives transform feedback captures for a topology. */
+static unsigned
+xfb_verts_per_prim(enum mesa_prim prim)
+{
+   switch (prim) {
+   case MESA_PRIM_POINTS:
+      return 1;
+   case MESA_PRIM_LINES:
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_LINES_ADJACENCY:
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return 2;
+   default:
+      return 3;
+   }
+}
+
+static bool
+xfb_enabled(const struct panvk_cmd_buffer *cmdbuf)
+{
+   return cmdbuf->state.gfx.xfb.offsets &&
+          panvk_shader_xfb_variant(cmdbuf->state.gfx.vs.shader);
+}
+
+/* Transform feedback for a draw (see panvk_xfb.h): runs the XFB variant of
+ * the vertex shader as a job with one invocation per captured vertex, using
+ * the draw's vertex job setup (attribute descriptors, offset_start,
+ * instance_size), then advances the buffer offsets.
+ *
+ * For a direct non-indexed draw, everything is known here: vertex_count is
+ * the vertex count of one instance. Otherwise, indirect_cmd is the
+ * Vk[Indexed]DrawIndirectCommand and index_min_max the result of the index
+ * range search (indexed draws), and a helper job fills in the rest.
+ */
+static void
+panvk_draw_emit_xfb(struct panvk_cmd_buffer *cmdbuf,
+                    const struct panvk_draw_data *draw, uint32_t vertex_count,
+                    uint64_t indirect_cmd, uint64_t index_min_max,
+                    bool xfb_only)
+{
+   const struct panvk_shader_variant *xfb_vs =
+      panvk_shader_xfb_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_desc_state *vs_desc_state =
+      &cmdbuf->state.gfx.vs.desc;
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   const enum mesa_prim prim = draw->info.prim;
+
+   if (!xfb_enabled(cmdbuf))
+      return;
+
+   const bool patched = indirect_cmd != 0;
+   const uint32_t vpp = xfb_verts_per_prim(prim);
+   const uint32_t prims =
+      patched ? 0 : u_decomposed_prims_for_vertices(prim, vertex_count);
+   if (!patched && !prims)
+      return;
+
+   struct pan_ptr params_ptr = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, sizeof(struct panvk_xfb_params), 8);
+   if (!params_ptr.gpu)
+      return;
+
+   /* The counts, first vertex/index and raw offset of a patched draw are
+    * filled in by panlib_jm_xfb_patch. */
+   struct panvk_xfb_params *params = params_ptr.cpu;
+   *params = (struct panvk_xfb_params){
+      .offsets = cmdbuf->state.gfx.xfb.offsets,
+      .index_buffer = draw->info.index.index_size
+                         ? draw->info.index.buffer_dev_addr
+                         : 0,
+      .index_size = draw->info.index.index_size,
+      .index_buffer_size_el =
+         draw->info.index.index_size
+            ? draw->info.index.buffer_size / draw->info.index.index_size
+            : 0,
+      .vertex_count = vertex_count,
+      .instance_count = draw->info.instance.count,
+      .first = draw->info.vertex.base,
+      .prim = prim,
+      .verts_per_prim = vpp,
+      .prims_per_instance = prims,
+      .raw_offset = draw->info.vertex.raw_offset,
+      .base_vertex = draw->info.vertex.base,
+      .base_instance = draw->info.instance.base,
+   };
+   for (unsigned i = 0; i < PANVK_XFB_MAX_BUFFERS; i++) {
+      params->buffer_addr[i] = cmdbuf->state.gfx.xfb.buffers[i].addr;
+      params->buffer_size[i] = cmdbuf->state.gfx.xfb.buffers[i].size;
+      params->stride[i] = xfb_vs->vs.xfb_stride[i];
+   }
+
+   /* With primitive restart, the patch job resolves the restarts into a list
+    * of captured vertices: at most verts_per_prim per index. The index count
+    * may only be known on the GPU, so size it for the whole index buffer
+    * (bounded; primitives past the end are dropped). */
+   if (patched && draw->info.index.index_size &&
+       draw->info.index.restart_enable) {
+      uint32_t list_size_el = MIN2(params->index_buffer_size_el, 1u << 20) * vpp;
+      struct pan_ptr list =
+         panvk_cmd_alloc_dev_mem(cmdbuf, desc, list_size_el * 4, 4);
+      if (!list.gpu)
+         return;
+
+      params->vertex_list = list.gpu;
+      params->vertex_list_size_el = list_size_el;
+   }
+
+   /* Only the XFB variant reads this sysval. */
+   cmdbuf->state.gfx.sysvals.vs.xfb_params = params_ptr.gpu;
+   struct pan_ptr push_uniforms;
+   if (panvk_per_arch(cmd_prepare_gfx_push_uniforms)(cmdbuf, xfb_vs,
+                                                     &push_uniforms, 1))
+      return;
+
+   struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
+   if (!job.gpu)
+      return;
+
+   batch->tlsinfo.tls.size =
+      MAX2(batch->tlsinfo.tls.size, xfb_vs->info.tls_size);
+
+   pan_pack_work_groups_compute(
+      pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), 1,
+      patched ? 1 : prims * vpp, patched ? 1 : draw->info.instance.count, 1,
+      1, 1, true, false);
+
+   pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = 5;
+   }
+
+   pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = panvk_priv_mem_dev_addr(xfb_vs->rsd);
+      cfg.attributes = draw->vs.attributes;
+      cfg.attribute_buffers = draw->vs.attribute_bufs;
+      cfg.thread_storage = draw->tls;
+      cfg.offset_start = draw->info.vertex.raw_offset;
+      cfg.instance_size =
+         draw->info.instance.count > 1 ? draw->padded_vertex_count : 1;
+      cfg.uniform_buffers = vs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_UBO];
+      cfg.push_uniforms = push_uniforms.gpu;
+      cfg.textures = vs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_TEXTURE];
+      cfg.samplers = vs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_SAMPLER];
+   }
+
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+
+   if (patched) {
+      const struct panvk_shader_variant *vs =
+         panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      const struct vk_vertex_input_state *vi =
+         cmdbuf->vk.dynamic_graphics_state.vi;
+
+      /* Without a vertex job, the draw helper didn't patch the attribute
+       * descriptors, we do it. */
+      const struct panlib_jm_xfb_patch_args patch_args = {
+         .params = params_ptr.gpu,
+         .cmd = indirect_cmd,
+         .index_min_max = index_min_max,
+         .xfb_job = job.gpu,
+         .attrib_bufs_descs = draw->vs.attribute_bufs,
+         .attrib_bufs_infos = draw->indirect_info.attrib_bufs,
+         .attribs_descs = draw->vs.attributes,
+         .attribs_infos = draw->indirect_info.attribs,
+         .idvs = vs->info.vs.idvs,
+         .attrib_bufs_valid = xfb_only ? vi->bindings_valid : 0,
+         .attribs_valid = xfb_only ? vi->attributes_valid : 0,
+      };
+      /* Like the draw helper: no prefetch of the job it patches. */
+      panlib_jm_xfb_patch_struct(&precomp_ctx, panlib_1d(1),
+                                 PANLIB_BARRIER_JM_BARRIER |
+                                    PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+                                 patch_args);
+   }
+
+   /* The barrier orders it after the descriptor copies, the patch job and
+    * the previous draw's offset update. A patched job must not be
+    * prefetched before the patch job wrote it. */
+   util_dynarray_append(&batch->jobs, job.cpu);
+   pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, true, patched, 0, 0,
+                  &job, false);
+
+   const struct panlib_jm_xfb_advance_args args = {
+      .params = params_ptr.gpu,
+   };
+   panlib_jm_xfb_advance_struct(&precomp_ctx, panlib_1d(1),
+                                PANLIB_BARRIER_JM_BARRIER, args);
+}
+
 /* Adds the primitives of a draw whose vertex count is known at record time to
  * the active primitives generated query. */
 static void
@@ -1478,8 +1666,11 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
    VkResult result;
 
-   /* If there's no vertex shader, we can skip the draw. */
-   if (!panvk_priv_mem_check_alloc(vs->rsd))
+   /* If there's no vertex shader, we can skip the draw, unless transform
+    * feedback captures its outputs (the HW variant is empty when nothing
+    * else uses them). */
+   const bool xfb_only = !panvk_priv_mem_check_alloc(vs->rsd);
+   if (xfb_only && !xfb_enabled(cmdbuf))
       return;
 
    /* Needs to be done before get_fs() is called because it depends on
@@ -1521,7 +1712,7 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
                                      ? util_bitcount(view_mask)
                                      : cmdbuf->state.gfx.render.layer_count;
 
-   for (uint32_t i = 0; i < enabled_layer_count; i++) {
+   for (uint32_t i = 0; i < enabled_layer_count && !xfb_only; i++) {
       const uint32_t layer = (view_mask != 0) ? u_bit_scan(&view_mask) : i;
       result = prepare_draw_layer(cmdbuf, draw, layer);
       if (result != VK_SUCCESS)
@@ -1542,6 +1733,8 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
       }
    }
 
+   panvk_draw_emit_xfb(cmdbuf, draw, draw->info.vertex.count, 0, 0, xfb_only);
+
    clear_dirty_after_draw(cmdbuf);
 }
 
@@ -1552,8 +1745,9 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
    VkResult result;
 
-   /* If there's no vertex shader, we can skip the draw. */
-   if (!panvk_priv_mem_check_alloc(vs->rsd))
+   /* See panvk_cmd_draw() */
+   const bool xfb_only = !panvk_priv_mem_check_alloc(vs->rsd);
+   if (xfb_only && !xfb_enabled(cmdbuf))
       return;
 
    /* Needs to be done before get_fs() is called because it depends on
@@ -1655,7 +1849,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
       job_before_indirect_helper = batch->vtc_jc.job_index;
    }
 
-   for (uint32_t i = 0; i < enabled_layer_count; i++) {
+   for (uint32_t i = 0; i < enabled_layer_count && !xfb_only; i++) {
       const uint32_t layer = (view_mask != 0) ? u_bit_scan(&view_mask) : i;
 
       /* Force a new push uniform block to be allocated */
@@ -1767,6 +1961,9 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
          }
       }
    }
+
+   panvk_draw_emit_xfb(cmdbuf, draw, 0, draw->info.indirect.buffer_dev_addr,
+                       index_min_max_res_ptr, xfb_only);
 
    /*
     * We split every ~1024 indirect draw.
