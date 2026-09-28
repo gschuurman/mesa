@@ -6,6 +6,7 @@
 #include "panvk_android.h"
 
 #include "panvk_device.h"
+#include "panvk_device_memory.h"
 #include "panvk_image.h"
 
 #include "vndk/hardware_buffer.h"
@@ -251,11 +252,10 @@ panvk_android_ahb_image_init(struct AHardwareBuffer *ahb,
 static VkResult
 panvk_android_import_ahb_memory(VkDevice device,
                                 const VkMemoryAllocateInfo *pAllocateInfo,
-                                struct AHardwareBuffer *ahb,
+                                struct AHardwareBuffer *ahb, bool ahb_owned,
                                 const VkAllocationCallbacks *pAllocator,
                                 VkDeviceMemory *pMemory)
 {
-   VK_FROM_HANDLE(vk_device, dev, device);
    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
    assert(handle && handle->numFds > 0);
    int dma_buf_fd = handle->data[0];
@@ -332,8 +332,8 @@ panvk_android_import_ahb_memory(VkDevice device,
       .allocationSize = mem_reqs.size,
       .memoryTypeIndex = mem_type_index,
    };
-   result = dev->dispatch_table.AllocateMemory(device, &alloc_info, pAllocator,
-                                               pMemory);
+   result = panvk_device_memory_alloc(device, &alloc_info, pAllocator, pMemory,
+                                      ahb_owned);
    if (result != VK_SUCCESS)
       close(dup_fd);
 
@@ -378,8 +378,10 @@ panvk_android_allocate_ahb_memory(VkDevice device,
          return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
+   /* An AHB allocated here is reported as an allocation, not an import. */
    result = panvk_android_import_ahb_memory(device, pAllocateInfo, ahb,
-                                            pAllocator, pMemory);
+                                            ahb_info == NULL, pAllocator,
+                                            pMemory);
    if (result != VK_SUCCESS) {
       AHardwareBuffer_release(ahb);
       return panvk_error(device, result);
