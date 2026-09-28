@@ -2726,6 +2726,13 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
       else if (instr->op == nir_op_f2f16_rtne)
          I->round = BI_ROUND_NONE; /* Nearest even */
 
+      /* Bifrost picks the flush mode per clause from the instruction size, so a
+       * conversion follows the FP32 mode. FP16 operations lowered to FP32 (see
+       * bi_lower_bit_size) must still flush FP16 denormals: use the conversion
+       * ftz override, as fquantize2f16 does. */
+      if (b->shader->arch < 9 && b->shader->ftz_fp16)
+         I->ftz = true;
+
       return;
    }
 
@@ -3006,9 +3013,14 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
                  s1, BI_CMPF_GT);
       break;
 
-   case nir_op_f2f32:
-      bi_f16_to_f32_to(b, dst, s0);
+   case nir_op_f2f32: {
+      bi_instr *I = bi_f16_to_f32_to(b, dst, s0);
+
+      /* See nir_op_f2f16 */
+      if (b->shader->arch < 9 && b->shader->ftz_fp16)
+         I->ftz = true;
       break;
+   }
 
    case nir_op_fquantize2f16: {
       bi_instr *f16 =
@@ -4252,6 +4264,7 @@ bi_compile_variant_nir(nir_shader *nir,
    unsigned execution_mode = nir->info.float_controls_execution_mode;
    ctx->rtz_fp16 = nir_is_rounding_mode_rtz(execution_mode, 16);
    ctx->rtz_fp32 = nir_is_rounding_mode_rtz(execution_mode, 32);
+   ctx->ftz_fp16 = nir_is_denorm_flush_to_zero(execution_mode, 16);
    ctx->ftz_fp32 = nir_is_denorm_flush_to_zero(execution_mode, 32);
 
    if (idvs == BI_IDVS_POSITION || idvs == BI_IDVS_VARYING) {
