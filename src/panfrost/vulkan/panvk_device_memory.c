@@ -41,15 +41,14 @@ panvk_memory_emit_report(struct panvk_device *device,
       return;
    }
 
+   const bool imported = mem->vk.import_handle_type && !mem->ahb_owned;
    VkDeviceMemoryReportEventTypeEXT type;
    if (alloc_info) {
-      type = mem->vk.import_handle_type
-                ? VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_IMPORT_EXT
-                : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATE_EXT;
+      type = imported ? VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_IMPORT_EXT
+                      : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATE_EXT;
    } else {
-      type = mem->vk.import_handle_type
-                ? VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_UNIMPORT_EXT
-                : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT;
+      type = imported ? VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_UNIMPORT_EXT
+                      : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT;
    }
 
    const uint32_t heap_index =
@@ -70,6 +69,16 @@ panvk_AllocateMemory(VkDevice _device,
                                                pAllocator, pMem);
    }
 
+   return panvk_device_memory_alloc(_device, pAllocateInfo, pAllocator, pMem,
+                                    false);
+}
+
+VkResult
+panvk_device_memory_alloc(VkDevice _device,
+                          const VkMemoryAllocateInfo *pAllocateInfo,
+                          const VkAllocationCallbacks *pAllocator,
+                          VkDeviceMemory *pMem, bool ahb_owned)
+{
    VK_FROM_HANDLE(panvk_device, device, _device);
    struct panvk_physical_device *physical_device =
       to_panvk_physical_device(device->vk.physical);
@@ -98,6 +107,8 @@ panvk_AllocateMemory(VkDevice _device,
                                  sizeof(*mem));
    if (mem == NULL)
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   mem->ahb_owned = ahb_owned;
 
    const VkImportMemoryFdInfoKHR *fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);

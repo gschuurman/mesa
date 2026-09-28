@@ -25,9 +25,18 @@ struct panvk_device_memory {
        * PANVK_DEBUG=dump. */
       void *host_mapping;
    } debug;
+
+   /* Imported from an AHardwareBuffer the driver allocated for an exportable
+    * allocation: reported as an allocation, not an import. */
+   bool ahb_owned;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_device_memory, vk.base, VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
+
+VkResult panvk_device_memory_alloc(VkDevice device,
+                                   const VkMemoryAllocateInfo *pAllocateInfo,
+                                   const VkAllocationCallbacks *pAllocator,
+                                   VkDeviceMemory *pMem, bool ahb_owned);
 
 #endif
