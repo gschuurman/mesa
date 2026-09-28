@@ -385,7 +385,7 @@ panvk_per_arch(get_physical_device_features)(
       .storagePushConstant8 = true,
       .shaderBufferInt64Atomics = PAN_ARCH >= 9,
       .shaderSharedInt64Atomics = PAN_ARCH >= 9,
-      .shaderFloat16 = PAN_ARCH >= 10,
+      .shaderFloat16 = PAN_ARCH == 7 || PAN_ARCH >= 10,
       .shaderInt8 = true,
       /* In theory, update-after-bind is supported on bifrost, but the
        * descriptor limits would be too low for the descriptorIndexing feature.
@@ -729,7 +729,7 @@ panvk_per_arch(get_physical_device_features)(
       .mutableDescriptorType = PAN_ARCH >= 9,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = PAN_ARCH >= 10,
+      .shaderFmaFloat16 = PAN_ARCH == 7 || PAN_ARCH >= 10,
       .shaderFmaFloat32 = true,
       .shaderFmaFloat64 = false,
 
