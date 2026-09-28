@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "nir_builder.h"
+
 #include "panvk_buffer.h"
 #include "panvk_cmd_meta.h"
 #include "panvk_entrypoints.h"
@@ -661,6 +663,276 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
    }
 }
 
+/* VK_ANDROID_external_format_resolve: the color attachment is rendered like
+ * any other, and resolved into the planes of the YCbCr image at the end of
+ * rendering. There is no color conversion: component c of a plane gets
+ * component ycbcr_swizzle[c] of the attachment (G is Y, B is Cb, R is Cr),
+ * averaged over the attachment texels a subsampled plane texel covers, which
+ * puts the chroma samples at the midpoint.
+ */
+struct panvk_meta_efr_key {
+   enum panvk_meta_object_key_type type;
+   VkFormat dst_format;
+   uint8_t swizzle[4];
+   uint8_t scale[2];
+};
+
+static nir_shader *
+build_efr_shader(const struct panvk_meta_efr_key *key)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, NULL, "panvk-meta-external-format-resolve");
+
+   const struct glsl_type *tex_type =
+      glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT);
+   nir_variable *tex_var =
+      nir_variable_create(b.shader, nir_var_uniform, tex_type, "src");
+   tex_var->data.descriptor_set = 0;
+   tex_var->data.binding = 0;
+   nir_deref_instr *tex = nir_build_deref_var(&b, tex_var);
+
+   nir_def *pos =
+      nir_f2u32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
+   nir_def *base =
+      nir_imul(&b, pos, nir_imm_ivec2(&b, key->scale[0], key->scale[1]));
+
+   nir_def *sum = nir_imm_vec4(&b, 0, 0, 0, 0);
+   for (unsigned y = 0; y < key->scale[1]; y++) {
+      for (unsigned x = 0; x < key->scale[0]; x++) {
+         nir_def *coord = nir_iadd(&b, base, nir_imm_ivec2(&b, x, y));
+         sum = nir_fadd(&b, sum,
+                        nir_txf(&b, coord, .texture_deref = tex,
+                                .lod = nir_imm_int(&b, 0)));
+      }
+   }
+   nir_def *avg =
+      nir_fmul_imm(&b, sum, 1.0f / (key->scale[0] * key->scale[1]));
+
+   nir_def *comps[4];
+   for (unsigned c = 0; c < 4; c++) {
+      switch (key->swizzle[c]) {
+      case VK_COMPONENT_SWIZZLE_R:
+      case VK_COMPONENT_SWIZZLE_G:
+      case VK_COMPONENT_SWIZZLE_B:
+      case VK_COMPONENT_SWIZZLE_A:
+         comps[c] = nir_channel(&b, avg, key->swizzle[c] - VK_COMPONENT_SWIZZLE_R);
+         break;
+      case VK_COMPONENT_SWIZZLE_ONE:
+         comps[c] = nir_imm_float(&b, 1.0f);
+         break;
+      default:
+         comps[c] = nir_imm_float(&b, 0.0f);
+         break;
+      }
+   }
+
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                           glsl_vec4_type(), "color");
+   out->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(&b, out, nir_vec(&b, comps, 4), 0xf);
+
+   return b.shader;
+}
+
+static VkResult
+get_efr_pipeline(struct panvk_device *dev, const struct panvk_meta_efr_key *key,
+                 VkPipelineLayout *layout_out, VkPipeline *pipeline_out)
+{
+   const enum panvk_meta_object_key_type layout_key =
+      PANVK_META_OBJECT_KEY_EXTERNAL_FORMAT_RESOLVE;
+   const VkDescriptorSetLayoutBinding binding = {
+      .binding = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+   };
+   const VkDescriptorSetLayoutCreateInfo desc_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+      .bindingCount = 1,
+      .pBindings = &binding,
+   };
+
+   VkResult result =
+      vk_meta_get_pipeline_layout(&dev->vk, &dev->meta, &desc_info, NULL,
+                                  &layout_key, sizeof(layout_key), layout_out);
+   if (result != VK_SUCCESS)
+      return result;
+
+   *pipeline_out = vk_meta_lookup_pipeline(&dev->meta, key, sizeof(*key));
+   if (*pipeline_out != VK_NULL_HANDLE)
+      return VK_SUCCESS;
+
+   const VkPipelineShaderStageNirCreateInfoMESA fs_nir_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+      .nir = build_efr_shader(key),
+   };
+   const VkPipelineShaderStageCreateInfo fs_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .pNext = &fs_nir_info,
+      .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .pName = "main",
+   };
+   const VkPipelineDepthStencilStateCreateInfo ds_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+   };
+   const VkPipelineDynamicStateCreateInfo dyn_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+   };
+   const struct vk_meta_rendering_info render = {
+      .samples = 1,
+      .color_attachment_count = 1,
+      .color_attachment_formats = {key->dst_format},
+      .color_attachment_write_masks = {VK_COLOR_COMPONENT_R_BIT |
+                                       VK_COLOR_COMPONENT_G_BIT |
+                                       VK_COLOR_COMPONENT_B_BIT |
+                                       VK_COLOR_COMPONENT_A_BIT},
+   };
+   const VkGraphicsPipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+      .stageCount = 1,
+      .pStages = &fs_info,
+      .pDepthStencilState = &ds_info,
+      .pDynamicState = &dyn_info,
+      .layout = *layout_out,
+   };
+
+   result = vk_meta_create_graphics_pipeline(&dev->vk, &dev->meta, &info,
+                                             &render, key, sizeof(*key),
+                                             pipeline_out);
+   ralloc_free(fs_nir_info.nir);
+
+   return result;
+}
+
+static void
+cmd_meta_external_format_resolve(struct panvk_cmd_buffer *cmdbuf,
+                                 const struct pan_fb_layout *fb,
+                                 struct panvk_image_view *src_iview,
+                                 struct panvk_image_view *dst_iview)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkCommandBuffer cmd = panvk_cmd_buffer_to_handle(cmdbuf);
+   const struct vk_format_ycbcr_info *ycbcr =
+      vk_format_get_ycbcr_info(dst_iview->vk.format);
+   VkResult result;
+
+   assert(ycbcr);
+
+   const VkImageViewCreateInfo src_view_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+      .image = vk_image_to_handle(src_iview->vk.image),
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = src_iview->vk.format,
+      .subresourceRange = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .baseMipLevel = src_iview->vk.base_mip_level,
+         .levelCount = 1,
+         .baseArrayLayer = src_iview->vk.base_array_layer,
+         .layerCount = 1,
+      },
+   };
+   VkImageView src_view;
+   result = vk_meta_create_image_view(&cmdbuf->vk, &dev->meta, &src_view_info,
+                                      &src_view);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmdbuf->vk, result);
+      return;
+   }
+
+   for (unsigned p = 0; p < ycbcr->n_planes; p++) {
+      const struct vk_format_ycbcr_plane *plane = &ycbcr->planes[p];
+      struct panvk_meta_efr_key key = {
+         .type = PANVK_META_OBJECT_KEY_EXTERNAL_FORMAT_RESOLVE,
+         .dst_format = plane->format,
+         .scale = {plane->denominator_scales[0], plane->denominator_scales[1]},
+      };
+      memcpy(key.swizzle, plane->ycbcr_swizzle, sizeof(key.swizzle));
+
+      VkPipelineLayout layout;
+      VkPipeline pipeline;
+      result = get_efr_pipeline(dev, &key, &layout, &pipeline);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmdbuf->vk, result);
+         return;
+      }
+
+      const VkImageViewUsageCreateInfo dst_view_usage = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+      };
+      const VkImageViewCreateInfo dst_view_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .pNext = &dst_view_usage,
+         .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+         .image = vk_image_to_handle(dst_iview->vk.image),
+         .viewType = VK_IMAGE_VIEW_TYPE_2D,
+         .format = plane->format,
+         .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT << p,
+            .baseMipLevel = dst_iview->vk.base_mip_level,
+            .levelCount = 1,
+            .baseArrayLayer = dst_iview->vk.base_array_layer,
+            .layerCount = 1,
+         },
+      };
+      VkImageView dst_view;
+      result = vk_meta_create_image_view(&cmdbuf->vk, &dev->meta,
+                                         &dst_view_info, &dst_view);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmdbuf->vk, result);
+         return;
+      }
+
+      /* The render area, in the plane's texels. */
+      const struct vk_meta_rect rect = {
+         .x0 = fb->render_area_px.min_x / key.scale[0],
+         .y0 = fb->render_area_px.min_y / key.scale[1],
+         .x1 = DIV_ROUND_UP(fb->render_area_px.max_x + 1, key.scale[0]),
+         .y1 = DIV_ROUND_UP(fb->render_area_px.max_y + 1, key.scale[1]),
+      };
+      const VkRenderingAttachmentInfo att = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .imageView = dst_view,
+         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      };
+      const VkRenderingInfo render = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+         .renderArea = {
+            .offset = {rect.x0, rect.y0},
+            .extent = {rect.x1 - rect.x0, rect.y1 - rect.y0},
+         },
+         .layerCount = 1,
+         .colorAttachmentCount = 1,
+         .pColorAttachments = &att,
+      };
+
+      disp->CmdBeginRendering(cmd, &render);
+      disp->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+      const VkDescriptorImageInfo image_info = {
+         .imageView = src_view,
+         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      };
+      const VkWriteDescriptorSet write = {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+         .pImageInfo = &image_info,
+      };
+      disp->CmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    layout, 0, 1, &write);
+
+      dev->meta.cmd_draw_volume(&cmdbuf->vk, &dev->meta, &rect, 1);
+      disp->CmdEndRendering(cmd);
+   }
+}
+
 void
 panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
 {
@@ -671,6 +943,7 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
    unsigned color_att_count =
       util_last_bit(bound_atts & MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS);
    VkRenderingAttachmentInfo color_atts[MAX_RTS];
+   uint32_t external_resolves = 0;
    for (uint32_t i = 0; i < color_att_count; i++) {
 
       const struct panvk_resolve_attachment *resolve_info =
@@ -687,6 +960,15 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
             panvk_image_view_to_handle(resolve_info->dst_iview),
          .resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL,
       };
+
+      /* Done separately, vk_meta doesn't know about it. */
+      if (resolve_info->mode ==
+          VK_RESOLVE_MODE_EXTERNAL_FORMAT_DOWNSAMPLE_BIT_ANDROID) {
+         external_resolves |= BITFIELD_BIT(i);
+         color_atts[i].resolveMode = VK_RESOLVE_MODE_NONE;
+         color_atts[i].resolveImageView = VK_NULL_HANDLE;
+         continue;
+      }
 
       if (resolve_info->mode != VK_RESOLVE_MODE_NONE)
          needs_resolve = true;
@@ -728,7 +1010,7 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
    if (resolve_info->mode != VK_RESOLVE_MODE_NONE)
       needs_resolve = true;
 
-   if (!needs_resolve)
+   if (!needs_resolve && !external_resolves)
       return;
 
 #if PAN_ARCH >= 10
@@ -774,7 +1056,20 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_cmd_meta_graphics_save_ctx save = {0};
 
+   /* The meta renderings below replace the render state: copy what the
+    * external format resolves need first. */
+   const struct pan_fb_layout fb_copy = *fb;
+   struct panvk_image_view *ext_src[MAX_RTS], *ext_dst[MAX_RTS];
+   u_foreach_bit(i, external_resolves) {
+      ext_src[i] = cmdbuf->state.gfx.render.color_attachments.iviews[i];
+      ext_dst[i] =
+         cmdbuf->state.gfx.render.color_attachments.resolve[i].dst_iview;
+   }
+
    meta_gfx_start(cmdbuf, &save);
-   vk_meta_resolve_rendering(&cmdbuf->vk, &dev->meta, &render_info);
+   if (needs_resolve)
+      vk_meta_resolve_rendering(&cmdbuf->vk, &dev->meta, &render_info);
+   u_foreach_bit(i, external_resolves)
+      cmd_meta_external_format_resolve(cmdbuf, &fb_copy, ext_src[i], ext_dst[i]);
    meta_gfx_end(cmdbuf, &save);
 }

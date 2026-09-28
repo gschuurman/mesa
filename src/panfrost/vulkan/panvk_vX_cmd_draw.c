@@ -197,11 +197,18 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
       assert(resolve.dst_iview != NULL);
       assert(resolve.dst_iview->pview.nr_samples == 1);
 
-      const struct pan_image *resolve_pimage =
-         pan_image_view_get_color_plane(&resolve.dst_iview->pview).image;
+      /* External format resolves (into a YCbCr image) are done after the
+       * render pass, from the stored color attachment, see
+       * cmd_meta_external_format_resolve(). */
+      const bool external_resolve =
+         att->resolveMode ==
+         VK_RESOLVE_MODE_EXTERNAL_FORMAT_DOWNSAMPLE_BIT_ANDROID;
 
-      if ((ms2ss || att->storeOp != VK_ATTACHMENT_STORE_OP_STORE) &&
-          !avoid_direct_resolve_to(resolve_pimage)) {
+      if (!external_resolve &&
+          (ms2ss || att->storeOp != VK_ATTACHMENT_STORE_OP_STORE) &&
+          !avoid_direct_resolve_to(
+             pan_image_view_get_color_plane(&resolve.dst_iview->pview)
+                .image)) {
          render->fb.resolve.rts[index] = (struct pan_fb_resolve_target) {
             .in_bounds = {
                .resolve = PAN_FB_RESOLVE_RT(index),

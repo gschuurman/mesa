@@ -236,6 +236,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_ycbcr_image_arrays = PAN_ARCH >= 10,
       .EXT_zero_initialize_device_memory = true,
       .EXT_inline_uniform_block = true,
+      .ANDROID_external_format_resolve = PAN_ARCH == 7 && has_gralloc,
       .ANDROID_external_memory_android_hardware_buffer = has_gralloc,
       .ANDROID_native_buffer = has_gralloc,
       .GOOGLE_decorate_string = true,
@@ -599,6 +600,10 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_EXT_primitive_topology_list_restart */
       .primitiveTopologyListRestart = true,
       .primitiveTopologyPatchListRestart = false,
+
+      /* VK_ANDROID_external_format_resolve */
+      .externalFormatResolve =
+         PAN_ARCH == 7 && vk_android_get_ugralloc() != NULL,
 
       /* VK_EXT_transform_feedback: emulated on v7, see panvk_xfb.h */
       .transformFeedback = PAN_ARCH == 7,
@@ -1314,6 +1319,12 @@ panvk_per_arch(get_physical_device_properties)(
 
       /* VK_ANDROID_native_buffer */
       .sharedImage = vk_android_get_front_buffer_usage() != 0,
+
+      /* VK_ANDROID_external_format_resolve: resolved by averaging 2x2 texels
+       * for 4:2:0 chroma, see cmd_meta_external_format_resolve(). */
+      .nullColorAttachmentWithExternalFormatResolve = false,
+      .externalFormatResolveChromaOffsetX = VK_CHROMA_LOCATION_MIDPOINT,
+      .externalFormatResolveChromaOffsetY = VK_CHROMA_LOCATION_MIDPOINT,
 
       /* VK_ARM_shader_core_properties */
       .pixelRate = device->model->rates.pixel,
