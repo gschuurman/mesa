@@ -611,7 +611,14 @@ typedef struct linear_ctx linear_ctx;
 void *linear_alloc_child(linear_ctx *ctx, unsigned size);
 
 typedef struct {
+   /* Minimum size of the buffers linear allocations are carved from. */
    unsigned min_buffer_size;
+
+   /* Size of the first buffer, allocated with the context. 0 means
+    * min_buffer_size. A smaller first buffer keeps contexts that often stay
+    * (nearly) empty cheap, while later buffers still use min_buffer_size.
+    */
+   unsigned initial_buffer_size;
 } linear_opts;
 
 /**
