@@ -1123,7 +1123,11 @@ linear_context_with_opts(void *ralloc_ctx, const linear_opts *opts)
       MAX2(ALIGN_POT(opts->min_buffer_size, default_min_buffer_size),
            default_min_buffer_size);
 
-   const unsigned size = min_buffer_size;
+   const unsigned size =
+      opts->initial_buffer_size
+         ? MIN2(ALIGN_POT(opts->initial_buffer_size, SUBALLOC_ALIGNMENT),
+                min_buffer_size)
+         : min_buffer_size;
    const unsigned canary_size = get_node_canary_size();
    const unsigned full_size =
       sizeof(linear_ctx) + canary_size + size;

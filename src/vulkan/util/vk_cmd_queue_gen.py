@@ -173,8 +173,13 @@ void vk_free_queue(struct vk_cmd_queue *queue);
 static inline void
 vk_cmd_queue_init(struct vk_cmd_queue *queue)
 {
+   /* Secondary command buffers of drivers that record them for replay get a
+    * queue at creation, and many are never recorded into (or only hold a
+    * few commands): don't allocate the first 64 KiB up front.
+    */
    linear_opts opts = {
-      .min_buffer_size = 64 * 1024
+      .min_buffer_size = 64 * 1024,
+      .initial_buffer_size = 1024,
    };
    queue->ctx = linear_context_with_opts(NULL, &opts);
    list_inithead(&queue->cmds);
