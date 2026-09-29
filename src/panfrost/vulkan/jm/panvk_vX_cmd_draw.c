@@ -1806,6 +1806,8 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
             cmdbuf, desc,
             sizeof(struct libpan_draw_helper_index_min_max_result), 8)
             .gpu;
+      const uint32_t index_count =
+         draw->info.index.buffer_size / draw->info.index.index_size;
       const struct panlib_draw_index_minmax_search_helper_args args = {
          .index_buffer_ptr = draw->info.index.buffer_dev_addr,
          .cmd = draw->info.indirect.buffer_dev_addr,
@@ -1815,10 +1817,17 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
          .max_ptr =
             index_min_max_res_ptr +
             offsetof(struct libpan_draw_helper_index_min_max_result, max),
+         .index_buffer_size_el = index_count,
       };
 
+      /* Without a single index in the buffer (e.g. a maintenance6 null index
+       * buffer), every index reads as zero: no search needed, and a search
+       * would be a zero-sized dispatch, which the job manager can't express.
+       */
       struct libpan_draw_helper_index_min_max_result val = {
-         .min = ((uint64_t)1 << (draw->info.index.index_size * 8)) - 1,
+         .min = index_count
+                   ? ((uint64_t)1 << (draw->info.index.index_size * 8)) - 1
+                   : 0,
          .max = 0,
       };
       uint64_t *raw_val = (uint64_t *)&val;
@@ -1837,15 +1846,16 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
                         0, copy_desc_job_id, &write_job, false);
       util_dynarray_append(&batch->jobs, write_job.cpu);
 
-      const uint32_t index_count =
-         draw->info.index.buffer_size / draw->info.index.index_size;
       uint32_t wg_count = DIV_ROUND_UP(index_count, 65536);
       assert(wg_count <= 65536);
 
-      panlib_draw_index_minmax_search_helper_struct(
-         &precomp_ctx, panlib_1d_with_jm_deps(wg_count, 0, write_job_id),
-         PANLIB_BARRIER_NONE, args, util_logbase2(draw->info.index.index_size),
-         draw->info.index.restart_enable);
+      if (wg_count) {
+         panlib_draw_index_minmax_search_helper_struct(
+            &precomp_ctx, panlib_1d_with_jm_deps(wg_count, 0, write_job_id),
+            PANLIB_BARRIER_NONE, args,
+            util_logbase2(draw->info.index.index_size),
+            draw->info.index.restart_enable);
+      }
       job_before_indirect_helper = batch->vtc_jc.job_index;
    }
 

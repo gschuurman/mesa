@@ -412,7 +412,8 @@ static void
 panlib_patch_draw(struct panlib_draw_info *draw)
 {
    /* First of all, we need to ensure each jobs have the proper header */
-   bool is_null_job = draw->vertex_range == 0 || draw->instance.count == 0;
+   bool is_null_job = draw->vertex_range == 0 || draw->vertex.count == 0 ||
+                      draw->instance.count == 0;
 
    if (draw->idvs_job != NULL) {
       panlib_patch_job_type_header(
@@ -554,7 +555,9 @@ panlib_draw_indexed_indirect_helper(
    const int32_t vertex_offset = cmd->vertexOffset;
    const uint32_t min_vertex = index_min_max_res->min;
    const uint32_t max_vertex = index_min_max_res->max;
-   const uint32_t vertex_range = max_vertex - min_vertex + 1;
+   /* min > max: no index was found (count 0, or only restart indices) */
+   const uint32_t vertex_range =
+      min_vertex <= max_vertex ? max_vertex - min_vertex + 1 : 0;
 
    struct panlib_draw_info draw = {
       .idvs_job = idvs_job,
@@ -594,11 +597,17 @@ panlib_draw_indexed_indirect_helper(
    *raw_vertex_offset_sysval = draw.vertex.raw_offset;
 }
 
+/* index_buffer_size_el is the number of indices in the bound index buffer.
+ * The caller dispatches enough threads to cover all of them. Indices past the
+ * end of the buffer read as zero (robustness, and maintenance6 null index
+ * buffers), so they add a zero to the range without being loaded.
+ */
 KERNEL(64)
 panlib_draw_index_minmax_search_helper(global uint8_t *index_buffer_ptr,
                                        global VkDrawIndexedIndirectCommand *cmd,
                                        global atomic_uint *min_ptr,
                                        global atomic_uint *max_ptr,
+                                       uint32_t index_buffer_size_el,
                                        uint32_t index_bytes_log2__3,
                                        uint8_t primitive_restart__2)
 {
@@ -609,17 +618,23 @@ panlib_draw_index_minmax_search_helper(global uint8_t *index_buffer_ptr,
    const uint32_t start = cmd->firstIndex;
    const uint32_t index_count = cmd->indexCount;
 
+   /* Number of the draw's indices that lie inside the buffer */
+   const uint32_t in_bounds_count =
+      start < index_buffer_size_el
+         ? MIN2(index_count, index_buffer_size_el - start)
+         : 0;
+
    uint32_t base_idx = cl_global_id.x * max_count_per_thread;
 
+   if (base_idx == 0 && in_bounds_count < index_count)
+      atomic_fetch_min(min_ptr, 0);
+
    /* If the thread is out of range, bail out */
-   if (base_idx >= index_count)
+   if (base_idx >= in_bounds_count)
       return;
 
    /* Compute expected max iteration to do in this thread */
-   uint32_t count = MIN2(max_count_per_thread, index_count - base_idx);
-
-   /* Sanity check so nothing weird will happen */
-   assert(base_idx + count <= index_count);
+   uint32_t count = MIN2(max_count_per_thread, in_bounds_count - base_idx);
 
    uint32_t local_min = ((uint64_t)1 << index_bit_size) - 1;
    uint32_t local_max = 0;
