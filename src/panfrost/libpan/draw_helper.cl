@@ -404,7 +404,8 @@ static void
 panlib_patch_draw(struct panlib_draw_info *draw)
 {
    /* First of all, we need to ensure each jobs have the proper header */
-   bool is_null_job = draw->vertex_range == 0 || draw->instance.count == 0;
+   bool is_null_job = draw->vertex_range == 0 || draw->vertex.count == 0 ||
+                      draw->instance.count == 0;
 
    if (draw->idvs_job != NULL) {
       panlib_patch_job_type_header(
@@ -546,7 +547,9 @@ panlib_draw_indexed_indirect_helper(
    const int32_t vertex_offset = cmd->vertexOffset;
    const uint32_t min_vertex = index_min_max_res->min;
    const uint32_t max_vertex = index_min_max_res->max;
-   const uint32_t vertex_range = max_vertex - min_vertex + 1;
+   /* min > max: no index was found (count 0, or only restart indices) */
+   const uint32_t vertex_range =
+      min_vertex <= max_vertex ? max_vertex - min_vertex + 1 : 0;
 
    struct panlib_draw_info draw = {
       .idvs_job = idvs_job,
