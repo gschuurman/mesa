@@ -197,6 +197,12 @@ write_core_6(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, co
    unsigned stride = MIN2(input_channels, 6);
    unsigned superblocks = etna_ml_calculate_tiling_v7(screen, operation, NULL, NULL);
    uint8_t *weights_maps[DIV_ROUND_UP(kernels_per_core, superblocks)];
+   /* kernels_per_core is rounded up, so when output_channels isn't a multiple of
+    * cores_used the last kernels have out_channel >= output_channels (e.g. 1001
+    * classes on 8 cores). Feed those from a zero-point kernel with a zero bias
+    * instead of reading past the end of the weight and bias tensors. */
+   unsigned kernel_size = operation->weight_width * operation->weight_height * operation->input_channels;
+   uint8_t *pad_kernel = NULL;
    uint32_t *initial_ptr = map;
    bool do_write = initial_ptr != NULL;
    uint64_t buffer = 0;
@@ -223,7 +229,15 @@ write_core_6(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, co
 
       for (unsigned kernel = 0; kernel < kernels_in_superblock; kernel++) {
          unsigned out_channel = core * kernels_in_superblock + kernel + superblock * DIV_ROUND_UP(kernels_per_core, superblocks) * cores_used;
-         weights_maps[kernel] = input + out_channel * operation->weight_width * operation->weight_height * input_channels;
+         if (out_channel < output_channels) {
+            weights_maps[kernel] = input + out_channel * operation->weight_width * operation->weight_height * input_channels;
+         } else {
+            if (!pad_kernel) {
+               pad_kernel = malloc(kernel_size);
+               memset(pad_kernel, operation->weight_zero_point, kernel_size);
+            }
+            weights_maps[kernel] = pad_kernel;
+         }
       }
 
       for (unsigned block = 0; block < DIV_ROUND_UP(input_channels, stride); block++) {
@@ -235,7 +249,8 @@ write_core_6(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, co
 
                uint32_t corr = calculate_bias_correction(weights_maps[kernel], operation);
                wb_stream_flush_zeroes(&wb_stream);
-               append_bits(biases[out_channel] - corr, 32, &bits_in_buffer, &buffer, &map, do_write);
+               uint32_t bias = out_channel < output_channels ? biases[out_channel] : 0;
+               append_bits(bias - corr, 32, &bits_in_buffer, &buffer, &map, do_write);
 
                for (int i = 1; i < stride; i++) {
                   wb_stream_write(&wb_stream, weights_maps[kernel][i]);
@@ -258,6 +273,8 @@ write_core_6(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, co
 
    if (bits_in_buffer > 0)
       append_bits(0, 32 - bits_in_buffer, &bits_in_buffer, &buffer, &map, do_write);
+
+   free(pad_kernel);
 
    return (uint8_t *)map - (uint8_t *)initial_ptr - 1;
 }
